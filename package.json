@@ -1,0 +1,10 @@
+{
+  "name": "renavkar-gallabox-poller",
+  "version": "1.0.0",
+  "description": "24/7 Gallabox WhatsApp Polling Daemon for Renavkar Real Estate AI Bot",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {}
+}
