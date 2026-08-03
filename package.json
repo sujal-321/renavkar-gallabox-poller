@@ -1,7 +1,7 @@
 {
   "name": "renavkar-gallabox-poller",
-  "version": "1.0.0",
-  "description": "24/7 Gallabox WhatsApp Polling Daemon for Renavkar Real Estate AI Bot",
+  "version": "1.1.0",
+  "description": "24/7 Gallabox WhatsApp Polling Daemon with Voice Note Transcription for Renavkar Real Estate AI Bot",
   "main": "index.js",
   "engines": {
     "node": ">=18.0.0"
@@ -9,5 +9,7 @@
   "scripts": {
     "start": "node index.js"
   },
-  "dependencies": {}
+  "dependencies": {
+    "form-data": "^4.0.0"
+  }
 }
