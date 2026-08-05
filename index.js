@@ -130,9 +130,7 @@ function checkOutboundLeads() {
   }, (res) => {
     let b = '';
     res.on('data', c => b += c);
-    res.on('end', () => {
-      // Outbound check complete silently
-    });
+    res.on('end', () => {});
   });
   req.on('error', () => {});
   req.end();
@@ -267,9 +265,9 @@ async function main() {
   }
 
   console.log(`✅ Seeded ${processedMessageIds.size} historical message IDs.`);
-  console.log(`🚀 24/7 Inbound Polling (every 3s) & Outbound Lead Check (every 60s) active...\n`);
+  console.log(`🚀 24/7 Inbound Polling (every 10s) & Outbound Lead Check (every 60s) active...\n`);
 
-  setInterval(pollOnce, 3000);
+  setInterval(pollOnce, 10000);
   setInterval(checkOutboundLeads, 60000);
 }
 
