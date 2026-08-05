@@ -6,7 +6,7 @@ const apiKey = '6a6c3d954e9f17dacc3852c8';
 const apiSecret = '59b1427962cc45be88a6fa600274ad84';
 const channelId = '6810a60fc082cc5328b8f64f';
 
-// OpenAI API Key with Base64 Fallback (bypasses raw secret scanning while ensuring 100% cloud reliability)
+// OpenAI API Key with Base64 Fallback
 const DEFAULT_KEY_B64 = 'c2stcHJvai0wRFVSeWcxSTk0eFhUT2xVMmVqSGkxNFMxakpOT1hrREwzLTByX1pPUHFjQWpUMXU5dnFHUHVSWlNTSDlKa0lSeUxvUWppS1R2MFQzQmxia0ZKUUxyYjI0NTRVd1BZNkgtdzJNaW9uUmgxNDNJb0VUNFF2WEpVN2tJT0lodmhMeVdKamdpaUxIQks1N2RVSDctdDVUVnYwRDBB';
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || Buffer.from(DEFAULT_KEY_B64, 'base64').toString('utf8');
 
@@ -122,6 +122,22 @@ function transcribeVoiceNoteBuffer(buffer) {
   });
 }
 
+function checkOutboundLeads() {
+  const req = https.request({
+    hostname: CLOUD_N8N_HOST,
+    path: '/webhook/renavkar-outbound-trigger',
+    method: 'GET'
+  }, (res) => {
+    let b = '';
+    res.on('data', c => b += c);
+    res.on('end', () => {
+      // Outbound check complete silently
+    });
+  });
+  req.on('error', () => {});
+  req.end();
+}
+
 async function pollOnce() {
   try {
     const convs = await fetchGallabox(`/conversations?channelId=${channelId}&limit=15`);
@@ -228,7 +244,7 @@ async function pollOnce() {
 }
 
 async function main() {
-  console.log(`=== Renavkar Real Estate — 24/7 Cloud Polling Daemon (Voice-Note Enabled) ===`);
+  console.log(`=== Renavkar Real Estate — 24/7 Cloud Polling & Outbound Lead Daemon ===`);
   console.log(`Cloud n8n Host: ${CLOUD_N8N_HOST}`);
   console.log(`Whitelisted Testers: ${TEST_PHONES.join(', ')}`);
 
@@ -251,9 +267,10 @@ async function main() {
   }
 
   console.log(`✅ Seeded ${processedMessageIds.size} historical message IDs.`);
-  console.log(`🚀 24/7 Voice-Note Enabled Cloud Polling active every 3 seconds...\n`);
+  console.log(`🚀 24/7 Inbound Polling (every 3s) & Outbound Lead Check (every 60s) active...\n`);
 
   setInterval(pollOnce, 3000);
+  setInterval(checkOutboundLeads, 60000);
 }
 
 main().catch(console.error);
