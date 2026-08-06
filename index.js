@@ -171,7 +171,14 @@ async function pollOnce() {
       const msgId = newestCustomerMsg.id || `${newestCustomerMsg.createdAt}_${newestCustomerMsg.whatsapp?.text?.body}`;
       if (processedMessageIds.has(msgId)) continue;
 
-      let msgText = newestCustomerMsg.whatsapp?.text?.body || newestCustomerMsg.text?.body || newestCustomerMsg.message?.text || '';
+      let msgText = newestCustomerMsg.whatsapp?.text?.body 
+        || newestCustomerMsg.whatsapp?.button?.text 
+        || newestCustomerMsg.whatsapp?.button?.payload
+        || newestCustomerMsg.whatsapp?.interactive?.button_reply?.title 
+        || newestCustomerMsg.whatsapp?.interactive?.list_reply?.title 
+        || newestCustomerMsg.text?.body 
+        || newestCustomerMsg.message?.text 
+        || '';
 
       // Extract Audio URL from Gallabox (whatsapp.audio.path)
       const audioUrl = newestCustomerMsg.whatsapp?.audio?.path
