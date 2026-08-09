@@ -161,11 +161,24 @@ async function pollOnce() {
 
       const msgs = await fetchGallabox(`/messages?channelId=${channelId}&contactId=${conv.contactId}&limit=5`);
       const msgList = Array.isArray(msgs) ? msgs : msgs?.data || [];
+      if (msgList.length === 0) continue;
+
+      msgList.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+      const overallLatestMsg = msgList[0];
+
+      // If the latest message in Gallabox is already an outbound message (from bot or team), skip re-triggering n8n!
+      if (overallLatestMsg.sender !== conv.contactId) {
+        const newestCust = msgList.find(m => m.sender === conv.contactId);
+        if (newestCust) {
+          const id = newestCust.id || `${newestCust.createdAt}_${newestCust.whatsapp?.text?.body}`;
+          processedMessageIds.add(id);
+        }
+        continue;
+      }
 
       const customerMsgs = msgList.filter(m => m.sender === conv.contactId);
       if (customerMsgs.length === 0) continue;
 
-      customerMsgs.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
       const newestCustomerMsg = customerMsgs[0];
 
       const msgId = newestCustomerMsg.id || `${newestCustomerMsg.createdAt}_${newestCustomerMsg.whatsapp?.text?.body}`;
