@@ -41,11 +41,12 @@ const config = {
   n8nUrl: String(process.env.N8N_URL || 'https://n8n-production-e558.up.railway.app').replace(/\/$/, ''),
   n8nInternalSecret: process.env.N8N_INTERNAL_SECRET || '',
   allowed: parseAllowedPhones(),
-  pollIntervalMs: numberEnv('RENAVKAR_POLL_INTERVAL_MS', 3000, 1000),
+  pollIntervalMs: numberEnv('RENAVKAR_POLL_INTERVAL_MS', 15000, 1000),
+  gallaboxRequestIntervalMs: numberEnv('RENAVKAR_GALLABOX_REQUEST_INTERVAL_MS', 1000, 0),
   apiTimeoutMs: numberEnv('RENAVKAR_API_TIMEOUT_MS', 15000, 1000),
   maxAudioBytes: numberEnv('RENAVKAR_MAX_AUDIO_BYTES', 15 * 1024 * 1024, 1024),
-  maxConversations: numberEnv('RENAVKAR_MAX_CONVERSATIONS', 25, 1),
-  maxMessagesPerConversation: numberEnv('RENAVKAR_MAX_MESSAGES', 50, 1),
+  maxConversations: numberEnv('RENAVKAR_MAX_CONVERSATIONS', 5, 1),
+  maxMessagesPerConversation: numberEnv('RENAVKAR_MAX_MESSAGES', 20, 1),
   seedAgeMs: numberEnv('RENAVKAR_SEED_AGE_MS', 120000, 0),
   stateFile: process.env.RENAVKAR_STATE_FILE || path.join(__dirname, 'data', 'renavkar-state.json'),
   stateRetentionMs: numberEnv('RENAVKAR_STATE_RETENTION_MS', 7 * 24 * 60 * 60 * 1000, 60000),
@@ -88,6 +89,27 @@ function requestBuffer(urlString, { method = 'GET', headers = {}, body = null, t
     if (body) request.write(body);
     request.end();
   });
+}
+
+function sleep(milliseconds) {
+  return new Promise(resolve => setTimeout(resolve, milliseconds));
+}
+
+function createThrottledFetch(fetchFn, intervalMs) {
+  let lastRequestAt = 0;
+  let chain = Promise.resolve();
+
+  return (...args) => {
+    const request = chain.then(async () => {
+      const waitMs = Math.max(0, intervalMs - (Date.now() - lastRequestAt));
+      if (waitMs) await sleep(waitMs);
+      const result = await fetchFn(...args);
+      lastRequestAt = Date.now();
+      return result;
+    });
+    chain = request.catch(() => undefined);
+    return request;
+  };
 }
 
 async function fetchGallabox(apiPath) {
@@ -298,9 +320,11 @@ function createPoller({ fetch = fetchGallabox, dispatch = sendToN8n, store, queu
     polling = true;
     try {
       const conversations = arrayFromApiResponse(await fetch(`/conversations?channelId=${encodeURIComponent(config.channelId)}&limit=${config.maxConversations}`));
-      await Promise.all(conversations.map(conversation => scanConversation(conversation).catch(error => {
-        console.error(`Conversation scan failed: ${error.message}`);
-      })));
+      for (const conversation of conversations) {
+        await scanConversation(conversation).catch(error => {
+          console.error(`Conversation scan failed: ${error.message}`);
+        });
+      }
       store.prune(config.stateRetentionMs);
     } finally {
       polling = false;
@@ -328,10 +352,11 @@ async function main() {
   validateConfig();
   const store = new JsonStateStore(config.stateFile);
   store.load();
-  await seedHistoricalMessages(store, fetchGallabox);
+  const throttledFetch = createThrottledFetch(fetchGallabox, config.gallaboxRequestIntervalMs);
+  await seedHistoricalMessages(store, throttledFetch);
 
-  const poller = createPoller({ store });
-  console.log(`Renavkar poller active; interval=${config.pollIntervalMs}ms, state=${config.stateFile}`);
+  const poller = createPoller({ store, fetch: throttledFetch });
+  console.log(`Renavkar poller active; interval=${config.pollIntervalMs}ms, Gallabox request interval=${config.gallaboxRequestIntervalMs}ms, state=${config.stateFile}`);
   await poller.pollOnce();
 
   const interval = setInterval(() => poller.pollOnce().catch(error => console.error(`Polling cycle failed: ${error.message}`)), config.pollIntervalMs);
@@ -358,6 +383,7 @@ module.exports = {
   arrayFromApiResponse,
   config,
   createPoller,
+  createThrottledFetch,
   downloadMediaBuffer,
   isAllowedPhone,
   normalizeMessage,
