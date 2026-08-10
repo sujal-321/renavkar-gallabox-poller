@@ -1,294 +1,366 @@
-const https = require('https');
+'use strict';
+
+const fs = require('fs');
 const http = require('http');
+const https = require('https');
+const path = require('path');
 
-const accountId = '67a9c520769cafdc2619b890';
-const apiKey = '6a6c3d954e9f17dacc3852c8';
-const apiSecret = '59b1427962cc45be88a6fa600274ad84';
-const channelId = '6810a60fc082cc5328b8f64f';
+const { KeyedSerialQueue } = require('./keyed_queue');
+const { JsonStateStore } = require('./state_store');
+const {
+  extractAudioUrl,
+  getPhone,
+  getMessageId,
+  isInbound,
+  normalizeMessage
+} = require('./message_utils');
 
-// OpenAI API Key with Base64 Fallback
-const DEFAULT_KEY_B64 = 'c2stcHJvai0wRFVSeWcxSTk0eFhUT2xVMmVqSGkxNFMxakpOT1hrREwzLTByX1pPUHFjQWpUMXU5dnFHUHVSWlNTSDlKa0lSeUxvUWppS1R2MFQzQmxia0ZKUUxyYjI0NTRVd1BZNkgtdzJNaW9uUmgxNDNJb0VUNFF2WEpVN2tJT0lodmhMeVdKamdpaUxIQks1N2RVSDctdDVUVnYwRDBB';
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY || Buffer.from(DEFAULT_KEY_B64, 'base64').toString('utf8');
+function numberEnv(name, fallback, minimum = 0) {
+  const value = Number(process.env[name]);
+  return Number.isFinite(value) && value >= minimum ? value : fallback;
+}
 
-// Whitelisted test phone numbers (Sujal Darla & Arihant Bhura)
-const TEST_PHONES = ['9014998200', '9714991000'];
-const CLOUD_N8N_HOST = 'n8n-production-e558.up.railway.app';
+function requiredEnv(name) {
+  const value = String(process.env[name] || '').trim();
+  if (!value) throw new Error(`Missing required environment variable: ${name}`);
+  return value;
+}
 
-const processedMessageIds = new Set();
-const lastProcessedTimes = new Map();
+function parseAllowedPhones() {
+  const raw = String(process.env.RENAVKAR_ALLOWED_PHONES || '9014998200,9714991000').trim();
+  if (raw === '*') return { allowAll: true, phones: [] };
+  return { allowAll: false, phones: raw.split(',').map(value => value.replace(/[^0-9]/g, '')).filter(Boolean) };
+}
 
-function fetchGallabox(path) {
-  return new Promise((resolve) => {
-    const req = https.request({
-      hostname: 'server.gallabox.com',
-      path: `/devapi/accounts/${accountId}${path}`,
-      method: 'GET',
-      headers: {
-        'apiKey': apiKey,
-        'apiSecret': apiSecret,
-        'Content-Type': 'application/json'
-      }
-    }, (res) => {
-      let body = '';
-      res.on('data', c => body += c);
-      res.on('end', () => {
-        try { resolve(JSON.parse(body)); }
-        catch (e) { resolve(null); }
+const config = {
+  accountId: process.env.GALLABOX_ACCOUNT_ID || '',
+  apiKey: process.env.GALLABOX_API_KEY || '',
+  apiSecret: process.env.GALLABOX_API_SECRET || '',
+  channelId: process.env.GALLABOX_CHANNEL_ID || '',
+  openAiKey: process.env.OPENAI_API_KEY || '',
+  n8nUrl: String(process.env.N8N_URL || 'https://n8n-production-e558.up.railway.app').replace(/\/$/, ''),
+  n8nInternalSecret: process.env.N8N_INTERNAL_SECRET || '',
+  allowed: parseAllowedPhones(),
+  pollIntervalMs: numberEnv('RENAVKAR_POLL_INTERVAL_MS', 3000, 1000),
+  apiTimeoutMs: numberEnv('RENAVKAR_API_TIMEOUT_MS', 15000, 1000),
+  maxAudioBytes: numberEnv('RENAVKAR_MAX_AUDIO_BYTES', 15 * 1024 * 1024, 1024),
+  maxConversations: numberEnv('RENAVKAR_MAX_CONVERSATIONS', 25, 1),
+  maxMessagesPerConversation: numberEnv('RENAVKAR_MAX_MESSAGES', 50, 1),
+  seedAgeMs: numberEnv('RENAVKAR_SEED_AGE_MS', 120000, 0),
+  stateFile: process.env.RENAVKAR_STATE_FILE || path.join(__dirname, 'data', 'renavkar-state.json'),
+  stateRetentionMs: numberEnv('RENAVKAR_STATE_RETENTION_MS', 7 * 24 * 60 * 60 * 1000, 60000),
+  outboundCheckEnabled: process.env.RENAVKAR_OUTBOUND_CHECK_ENABLED !== 'false'
+};
+
+function validateConfig() {
+  for (const name of ['GALLABOX_ACCOUNT_ID', 'GALLABOX_API_KEY', 'GALLABOX_API_SECRET', 'GALLABOX_CHANNEL_ID', 'OPENAI_API_KEY']) {
+    if (!process.env[name]) throw new Error(`Missing required environment variable: ${name}`);
+  }
+}
+
+function requestBuffer(urlString, { method = 'GET', headers = {}, body = null, timeoutMs = config.apiTimeoutMs, maxBytes = Infinity } = {}) {
+  return new Promise((resolve, reject) => {
+    const url = new URL(urlString);
+    const client = url.protocol === 'http:' ? http : https;
+    const request = client.request(url, { method, headers }, response => {
+      const chunks = [];
+      let total = 0;
+
+      response.on('data', chunk => {
+        total += chunk.length;
+        if (total <= maxBytes) chunks.push(chunk);
+      });
+      response.on('end', () => {
+        if (total > maxBytes) return reject(new Error(`Response exceeded ${maxBytes} bytes`));
+        const buffer = Buffer.concat(chunks);
+        if (response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
+          return resolve({ redirect: new URL(response.headers.location, url).toString() });
+        }
+        if (response.statusCode < 200 || response.statusCode >= 300) {
+          return reject(new Error(`HTTP ${response.statusCode}: ${buffer.toString('utf8').slice(0, 500)}`));
+        }
+        resolve({ statusCode: response.statusCode, headers: response.headers, buffer });
       });
     });
-    req.on('error', () => resolve(null));
-    req.end();
+
+    request.setTimeout(timeoutMs, () => request.destroy(new Error(`Request timed out after ${timeoutMs}ms`)));
+    request.on('error', reject);
+    if (body) request.write(body);
+    request.end();
   });
 }
 
-function downloadMediaBuffer(urlStr) {
-  return new Promise((resolve) => {
-    try {
-      const client = urlStr.startsWith('https') ? https : http;
-      client.get(urlStr, (res) => {
-        if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-          return downloadMediaBuffer(res.headers.location).then(resolve);
-        }
-        const chunks = [];
-        res.on('data', c => chunks.push(c));
-        res.on('end', () => resolve(Buffer.concat(chunks)));
-      }).on('error', (e) => {
-        console.error('Audio download error:', e.message);
-        resolve(null);
-      });
-    } catch(e) {
-      console.error('Audio download exception:', e.message);
-      resolve(null);
+async function fetchGallabox(apiPath) {
+  const result = await requestBuffer(`https://server.gallabox.com/devapi/accounts/${config.accountId}${apiPath}`, {
+    headers: {
+      apiKey: config.apiKey,
+      apiSecret: config.apiSecret,
+      Accept: 'application/json'
     }
   });
+  return JSON.parse(result.buffer.toString('utf8'));
+}
+
+async function downloadMediaBuffer(urlString, redirectCount = 0) {
+  if (!urlString || redirectCount > 3) return null;
+
+  try {
+    const result = await requestBuffer(urlString, { maxBytes: config.maxAudioBytes });
+    if (result.redirect) return downloadMediaBuffer(result.redirect, redirectCount + 1);
+    return result.buffer;
+  } catch (error) {
+    console.error(`Audio download failed: ${error.message}`);
+    return null;
+  }
 }
 
 function transcribeVoiceNoteBuffer(buffer) {
-  return new Promise((resolve) => {
-    if (!buffer || buffer.length === 0 || !OPENAI_API_KEY) {
-      if (!OPENAI_API_KEY) console.error('⚠️ OPENAI_API_KEY is missing.');
-      return resolve(null);
-    }
+  return new Promise((resolve, reject) => {
+    if (!buffer?.length) return reject(new Error('Voice note is empty'));
+    if (!config.openAiKey) return reject(new Error('OPENAI_API_KEY is not configured'));
 
-    const boundary = '----WebKitFormBoundary' + Math.random().toString(16).substring(2);
-    
-    let header = `--${boundary}\r\n`;
-    header += `Content-Disposition: form-data; name="file"; filename="audio.ogg"\r\n`;
-    header += `Content-Type: audio/ogg\r\n\r\n`;
+    const boundary = `----RenavkarBoundary${Math.random().toString(16).slice(2)}`;
+    const header = Buffer.from(
+      `--${boundary}\r\n` +
+      'Content-Disposition: form-data; name="file"; filename="voice-note.ogg"\r\n' +
+      'Content-Type: audio/ogg\r\n\r\n',
+      'utf8'
+    );
+    const fields = Buffer.from(
+      `\r\n--${boundary}\r\n` +
+      'Content-Disposition: form-data; name="model"\r\n\r\nwhisper-1\r\n' +
+      `--${boundary}\r\n` +
+      'Content-Disposition: form-data; name="prompt"\r\n\r\nIndian English Hinglish real estate voice note about Avestia Stay, studio apartment price and ROI\r\n' +
+      `--${boundary}--\r\n`,
+      'utf8'
+    );
+    const body = Buffer.concat([header, buffer, fields]);
 
-    let fields = `\r\n--${boundary}\r\n`;
-    fields += `Content-Disposition: form-data; name="model"\r\n\r\nwhisper-1\r\n`;
-    fields += `--${boundary}\r\n`;
-    fields += `Content-Disposition: form-data; name="prompt"\r\n\r\nIndian English Hinglish real estate voice note Avestia Stay studio apartment price ROI\r\n`;
-    fields += `--${boundary}--\r\n`;
-
-    const bodyBuffer = Buffer.concat([
-      Buffer.from(header, 'utf8'),
-      buffer,
-      Buffer.from(fields, 'utf8')
-    ]);
-
-    const req = https.request({
-      hostname: 'api.openai.com',
-      path: '/v1/audio/transcriptions',
+    requestBuffer('https://api.openai.com/v1/audio/transcriptions', {
       method: 'POST',
       headers: {
-        'Authorization': `Bearer ${OPENAI_API_KEY}`,
+        Authorization: `Bearer ${config.openAiKey}`,
         'Content-Type': `multipart/form-data; boundary=${boundary}`,
-        'Content-Length': bodyBuffer.length
-      }
-    }, (res) => {
-      let b = '';
-      res.on('data', c => b += c);
-      res.on('end', () => {
-        try {
-          const parsed = JSON.parse(b);
-          if (parsed.error) console.error('Whisper API Error:', parsed.error);
-          resolve(parsed.text || null);
-        } catch(e) {
-          console.error('Whisper parse error:', e.message);
-          resolve(null);
-        }
-      });
-    });
-
-    req.on('error', (err) => {
-      console.error('Whisper transcription request error:', err.message);
-      resolve(null);
-    });
-
-    req.write(bodyBuffer);
-    req.end();
+        'Content-Length': body.length
+      },
+      body,
+      maxBytes: 1024 * 1024
+    })
+      .then(result => {
+        const payload = JSON.parse(result.buffer.toString('utf8'));
+        if (!payload.text?.trim()) throw new Error(payload.error?.message || 'Transcription was empty');
+        resolve(payload.text.trim());
+      })
+      .catch(reject);
   });
 }
 
-function checkOutboundLeads() {
-  const req = https.request({
-    hostname: CLOUD_N8N_HOST,
-    path: '/webhook/renavkar-outbound-trigger',
-    method: 'GET'
-  }, (res) => {
-    let b = '';
-    res.on('data', c => b += c);
-    res.on('end', () => {});
-  });
-  req.on('error', () => {});
-  req.end();
+function arrayFromApiResponse(value) {
+  return Array.isArray(value) ? value : (Array.isArray(value?.data) ? value.data : []);
 }
 
-async function pollOnce() {
+function isAllowedPhone(phone) {
+  return config.allowed.allowAll || config.allowed.phones.some(allowed => phone.includes(allowed));
+}
+
+function messageTimestamp(message) {
+  const timestamp = new Date(message?.createdAt || 0).getTime();
+  return Number.isFinite(timestamp) ? timestamp : 0;
+}
+
+async function sendToN8n(payload) {
+  const body = Buffer.from(JSON.stringify(payload), 'utf8');
+  const headers = {
+    'Content-Type': 'application/json',
+    'Content-Length': body.length,
+    'x-renavkar-source': 'gallabox-poller'
+  };
+  if (config.n8nInternalSecret) headers['x-renavkar-internal-secret'] = config.n8nInternalSecret;
+
+  const result = await requestBuffer(`${config.n8nUrl}/webhook/renavkar-whatsapp`, {
+    method: 'POST',
+    headers,
+    body
+  });
+
+  return result.buffer.toString('utf8');
+}
+
+async function checkOutboundLeads() {
+  if (!config.outboundCheckEnabled) return;
   try {
-    const convs = await fetchGallabox(`/conversations?channelId=${channelId}&limit=15`);
-    const items = Array.isArray(convs) ? convs : convs?.data || [];
+    await requestBuffer(`${config.n8nUrl}/webhook/renavkar-outbound-trigger`, {
+      headers: config.n8nInternalSecret ? { 'x-renavkar-internal-secret': config.n8nInternalSecret } : {}
+    });
+  } catch (error) {
+    console.error(`Outbound lead check failed: ${error.message}`);
+  }
+}
 
-    for (const conv of items) {
-      if (!conv || !conv.contactId) continue;
+async function enrichVoiceMessage(message, contact) {
+  const audioUrl = extractAudioUrl(message);
+  if (!audioUrl) return normalizeMessage(message, { contact, contactId: message.contactId });
 
-      const contact = await fetchGallabox(`/contacts/${conv.contactId}`);
-      if (!contact) continue;
+  const audio = await downloadMediaBuffer(audioUrl);
+  if (!audio) {
+    return normalizeMessage(message, {
+      contact,
+      contactId: message.contactId,
+      transcriptionError: new Error('Audio download failed')
+    });
+  }
 
-      const phoneList = contact.phone || [];
-      const rawPhone = phoneList[0] || '';
-      const cleanPhone = String(rawPhone).replace(/[^0-9]/g, '');
+  try {
+    const transcription = await transcribeVoiceNoteBuffer(audio);
+    return normalizeMessage(message, { contact, contactId: message.contactId, transcription });
+  } catch (error) {
+    console.error(`Voice transcription failed: ${error.message}`);
+    return normalizeMessage(message, { contact, contactId: message.contactId, transcriptionError: error });
+  }
+}
 
-      const isWhitelisted = TEST_PHONES.some(p => cleanPhone.includes(p));
-      if (!isWhitelisted) continue;
+function createPoller({ fetch = fetchGallabox, dispatch = sendToN8n, store, queue = new KeyedSerialQueue() } = {}) {
+  let polling = false;
 
-      const lastTime = lastProcessedTimes.get(cleanPhone) || 0;
-      if (Date.now() - lastTime < 8000) {
-        continue;
-      }
+  async function processMessage(message, contact) {
+    const contactId = message.contactId;
+    const candidateMessageId = getMessageId(message, contactId);
+    const previous = store.getMessage(candidateMessageId);
+    if (previous?.status === 'done' || previous?.status === 'seeded') return;
 
-      const msgs = await fetchGallabox(`/messages?channelId=${channelId}&contactId=${conv.contactId}&limit=5`);
-      const msgList = Array.isArray(msgs) ? msgs : msgs?.data || [];
-      if (msgList.length === 0) continue;
+    const normalized = await enrichVoiceMessage({ ...message, contactId }, contact);
+    const messageId = normalized.message_id;
+    const phone = normalized.sender_phone;
+    if (!phone || !isAllowedPhone(phone)) return;
 
-      msgList.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
-      const overallLatestMsg = msgList[0];
+    const attempts = Number(previous?.attempts || 0) + 1;
+    store.mark(messageId, {
+      status: 'processing',
+      attempts,
+      createdAt: normalized.received_at,
+      phone,
+      contactId,
+      lastError: ''
+    });
 
-      // If the latest message in Gallabox is already an outbound message (from bot or team), skip re-triggering n8n!
-      if (overallLatestMsg.sender !== conv.contactId) {
-        const newestCust = msgList.find(m => m.sender === conv.contactId);
-        if (newestCust) {
-          const id = newestCust.id || `${newestCust.createdAt}_${newestCust.whatsapp?.text?.body}`;
-          processedMessageIds.add(id);
-        }
-        continue;
-      }
-
-      const customerMsgs = msgList.filter(m => m.sender === conv.contactId);
-      if (customerMsgs.length === 0) continue;
-
-      const newestCustomerMsg = customerMsgs[0];
-
-      const msgId = newestCustomerMsg.id || `${newestCustomerMsg.createdAt}_${newestCustomerMsg.whatsapp?.text?.body}`;
-      if (processedMessageIds.has(msgId)) continue;
-
-      let msgText = newestCustomerMsg.whatsapp?.text?.body 
-        || newestCustomerMsg.whatsapp?.button?.text 
-        || newestCustomerMsg.whatsapp?.button?.payload
-        || newestCustomerMsg.whatsapp?.interactive?.button_reply?.title 
-        || newestCustomerMsg.whatsapp?.interactive?.list_reply?.title 
-        || newestCustomerMsg.text?.body 
-        || newestCustomerMsg.message?.text 
-        || '';
-
-      // Extract Audio URL from Gallabox (whatsapp.audio.path)
-      const audioUrl = newestCustomerMsg.whatsapp?.audio?.path
-        || newestCustomerMsg.whatsapp?.audio?.link 
-        || newestCustomerMsg.whatsapp?.audio?.url
-        || newestCustomerMsg.whatsapp?.voice?.path
-        || newestCustomerMsg.whatsapp?.voice?.link
-        || newestCustomerMsg.whatsapp?.voice?.url
-        || newestCustomerMsg.mediaUrl
-        || newestCustomerMsg.media?.url
-        || null;
-
-      if (!msgText && audioUrl) {
-        console.log(`\n[${new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata' })}] 🎤 VOICE NOTE DETECTED from ${contact.name} (+91${cleanPhone})`);
-        console.log(`Downloading audio from Gallabox: ${audioUrl}`);
-        const audioBuffer = await downloadMediaBuffer(audioUrl);
-        if (audioBuffer && audioBuffer.length > 0) {
-          console.log(`Transcribing voice note with OpenAI Whisper... (${audioBuffer.length} bytes)`);
-          const transcribedText = await transcribeVoiceNoteBuffer(audioBuffer);
-          if (transcribedText && transcribedText.trim()) {
-            msgText = `[Voice Note Transcribed]: ${transcribedText.trim()}`;
-            console.log(`✨ Transcribed text: "${msgText}"`);
-          } else {
-            console.log('⚠️ Whisper transcription returned empty text.');
-          }
-        } else {
-          console.log('⚠️ Failed to download audio buffer.');
-        }
-      }
-
-      if (!msgText || msgText.trim() === '') continue;
-
-      processedMessageIds.add(msgId);
-      lastProcessedTimes.set(cleanPhone, Date.now());
-
-      console.log(`\n[${new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata' })}] 📩 NEW TESTER MESSAGE:`);
-      console.log(`From: ${contact.name} (+91${cleanPhone})`);
-      console.log(`Message Content: "${msgText}"`);
-
-      const payload = JSON.stringify({
+    try {
+      await dispatch({
         event: 'message.received',
-        contact: { phone: '+' + cleanPhone, name: contact.name },
-        message: { text: msgText }
+        contact: { phone: `+${phone}`, name: normalized.sender_name },
+        message: { text: normalized.message_text },
+        message_id: normalized.message_id,
+        conversation_id: normalized.conversation_id,
+        button_payload: normalized.button_payload,
+        button_text: normalized.button_text,
+        voice_note_status: normalized.voice_note_status,
+        voice_note_transcription: normalized.voice_note_transcription,
+        source: normalized.source,
+        received_at: normalized.received_at
       });
-
-      const req = https.request({
-        hostname: CLOUD_N8N_HOST,
-        path: '/webhook/renavkar-whatsapp',
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Content-Length': Buffer.byteLength(payload)
-        }
-      }, (res) => {
-        let body = '';
-        res.on('data', c => body += c);
-        res.on('end', () => {
-          console.log(`⚡ Cloud n8n AI Triggered: [${res.statusCode}] ${body}`);
-        });
-      });
-      req.on('error', (err) => console.error('Cloud n8n dispatch error:', err.message));
-      req.write(payload);
-      req.end();
+      store.mark(messageId, { status: 'done', completedAt: new Date().toISOString() });
+      console.log(`Processed ${messageId} for ${phone}`);
+    } catch (error) {
+      store.mark(messageId, { status: 'failed', lastError: error.message, failedAt: new Date().toISOString() });
+      console.error(`Dispatch failed for ${messageId}: ${error.message}`);
     }
-  } catch (err) {
-    console.error('Polling cycle error:', err.message);
+  }
+
+  async function scanConversation(conversation) {
+    if (!conversation?.contactId) return;
+    const contact = await fetch(`/contacts/${conversation.contactId}`);
+    if (!contact) return;
+
+    const messagesResponse = await fetch(`/messages?channelId=${encodeURIComponent(config.channelId)}&contactId=${encodeURIComponent(conversation.contactId)}&limit=${config.maxMessagesPerConversation}`);
+    const messages = arrayFromApiResponse(messagesResponse)
+      .filter(message => isInbound(message, conversation.contactId))
+      .sort((a, b) => messageTimestamp(a) - messageTimestamp(b));
+
+    for (const message of messages) {
+      const messageId = getMessageId(message, conversation.contactId);
+      const existing = store.getMessage(messageId);
+      const age = Date.now() - messageTimestamp(message);
+
+      if (!existing && age > config.seedAgeMs) {
+        store.mark(messageId, { status: 'seeded', createdAt: message.createdAt, contactId: conversation.contactId });
+        continue;
+      }
+      if (existing?.status === 'processing' && Date.now() - new Date(existing.updatedAt).getTime() < config.apiTimeoutMs * 2) continue;
+      if (existing?.status === 'failed' && Date.now() - new Date(existing.failedAt || 0).getTime() < 10000) continue;
+
+      const phone = getPhone(contact);
+      if (!phone || !isAllowedPhone(phone)) continue;
+      await queue.run(phone, () => processMessage({ ...message, contactId: conversation.contactId }, contact));
+    }
+  }
+
+  async function pollOnce() {
+    if (polling) return;
+    polling = true;
+    try {
+      const conversations = arrayFromApiResponse(await fetch(`/conversations?channelId=${encodeURIComponent(config.channelId)}&limit=${config.maxConversations}`));
+      await Promise.all(conversations.map(conversation => scanConversation(conversation).catch(error => {
+        console.error(`Conversation scan failed: ${error.message}`);
+      })));
+      store.prune(config.stateRetentionMs);
+    } finally {
+      polling = false;
+    }
+  }
+
+  return { pollOnce, processMessage, scanConversation };
+}
+
+async function seedHistoricalMessages(store, fetchFn) {
+  const conversations = arrayFromApiResponse(await fetchFn(`/conversations?channelId=${encodeURIComponent(config.channelId)}&limit=${config.maxConversations}`));
+  const cutoff = Date.now() - config.seedAgeMs;
+  for (const conversation of conversations) {
+    if (!conversation?.contactId) continue;
+    const messages = arrayFromApiResponse(await fetchFn(`/messages?channelId=${encodeURIComponent(config.channelId)}&contactId=${encodeURIComponent(conversation.contactId)}&limit=${config.maxMessagesPerConversation}`));
+    for (const message of messages) {
+      if (isInbound(message, conversation.contactId) && messageTimestamp(message) < cutoff) {
+        store.mark(getMessageId(message, conversation.contactId), { status: 'seeded', createdAt: message.createdAt, contactId: conversation.contactId });
+      }
+    }
   }
 }
 
 async function main() {
-  console.log(`=== Renavkar Real Estate — 24/7 Cloud Polling & Outbound Lead Daemon ===`);
-  console.log(`Cloud n8n Host: ${CLOUD_N8N_HOST}`);
-  console.log(`Whitelisted Testers: ${TEST_PHONES.join(', ')}`);
+  validateConfig();
+  const store = new JsonStateStore(config.stateFile);
+  store.load();
+  await seedHistoricalMessages(store, fetchGallabox);
 
-  const convs = await fetchGallabox(`/conversations?channelId=${channelId}&limit=15`);
-  const items = Array.isArray(convs) ? convs : convs?.data || [];
+  const poller = createPoller({ store });
+  console.log(`Renavkar poller active; interval=${config.pollIntervalMs}ms, state=${config.stateFile}`);
+  await poller.pollOnce();
 
-  for (const conv of items) {
-    if (!conv?.contactId) continue;
-    const msgs = await fetchGallabox(`/messages?channelId=${channelId}&contactId=${conv.contactId}&limit=10`);
-    const msgList = Array.isArray(msgs) ? msgs : msgs?.data || [];
-    msgList.forEach(m => {
-      if (m.sender === conv.contactId) {
-        const ageMs = Date.now() - new Date(m.createdAt).getTime();
-        if (ageMs > 120000) {
-          const id = m.id || `${m.createdAt}_${m.whatsapp?.text?.body}`;
-          processedMessageIds.add(id);
-        }
-      }
-    });
-  }
+  const interval = setInterval(() => poller.pollOnce().catch(error => console.error(`Polling cycle failed: ${error.message}`)), config.pollIntervalMs);
+  const outboundInterval = setInterval(() => checkOutboundLeads(), 60000);
 
-  console.log(`✅ Seeded ${processedMessageIds.size} historical message IDs.`);
-  console.log(`🚀 24/7 Inbound Polling (every 10s) & Outbound Lead Check (every 60s) active...\n`);
-
-  setInterval(pollOnce, 10000);
-  setInterval(checkOutboundLeads, 60000);
+  const shutdown = () => {
+    clearInterval(interval);
+    clearInterval(outboundInterval);
+    store.save();
+    process.exit(0);
+  };
+  process.on('SIGTERM', shutdown);
+  process.on('SIGINT', shutdown);
 }
 
-main().catch(console.error);
+if (require.main === module) {
+  main().catch(error => {
+    console.error(error.message);
+    process.exit(1);
+  });
+}
+
+module.exports = {
+  arrayFromApiResponse,
+  config,
+  createPoller,
+  downloadMediaBuffer,
+  isAllowedPhone,
+  normalizeMessage,
+  seedHistoricalMessages,
+  transcribeVoiceNoteBuffer
+};
