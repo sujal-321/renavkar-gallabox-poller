@@ -46,8 +46,10 @@ const config = {
   gallaboxRateLimitBackoffMs: numberEnv('RENAVKAR_GALLABOX_RATE_LIMIT_BACKOFF_MS', 60000, 1000),
   apiTimeoutMs: numberEnv('RENAVKAR_API_TIMEOUT_MS', 15000, 1000),
   maxAudioBytes: numberEnv('RENAVKAR_MAX_AUDIO_BYTES', 15 * 1024 * 1024, 1024),
-  maxConversations: numberEnv('RENAVKAR_MAX_CONVERSATIONS', 5, 1),
+  maxConversations: numberEnv('RENAVKAR_MAX_CONVERSATIONS', 25, 1),
   maxMessagesPerConversation: numberEnv('RENAVKAR_MAX_MESSAGES', 20, 1),
+  conversationLookbackMs: numberEnv('RENAVKAR_CONVERSATION_LOOKBACK_MS', 5 * 60 * 1000, 60000),
+  contactCacheTtlMs: numberEnv('RENAVKAR_CONTACT_CACHE_TTL_MS', 60 * 60 * 1000, 60000),
   seedAgeMs: numberEnv('RENAVKAR_SEED_AGE_MS', 120000, 0),
   seedHistoryEnabled: process.env.RENAVKAR_SEED_HISTORY_ENABLED === 'true',
   stateFile: process.env.RENAVKAR_STATE_FILE || path.join(__dirname, 'data', 'renavkar-state.json'),
@@ -202,6 +204,21 @@ function messageTimestamp(message) {
   return Number.isFinite(timestamp) ? timestamp : 0;
 }
 
+function parseDispatchAck(responseText, expectedMessageId) {
+  let ack;
+  try {
+    ack = JSON.parse(responseText);
+  } catch (error) {
+    throw new Error(`n8n returned a non-JSON acknowledgement: ${String(responseText).slice(0, 200)}`);
+  }
+
+  if (ack?.ok !== true) throw new Error('n8n did not confirm that the WhatsApp reply was handled');
+  if (String(ack.message_id || '') !== String(expectedMessageId || '')) {
+    throw new Error(`n8n acknowledgement message mismatch: expected ${expectedMessageId}, received ${ack?.message_id || 'empty'}`);
+  }
+  return ack;
+}
+
 async function sendToN8n(payload) {
   const body = Buffer.from(JSON.stringify(payload), 'utf8');
   const headers = {
@@ -217,7 +234,7 @@ async function sendToN8n(payload) {
     body
   });
 
-  return result.buffer.toString('utf8');
+  return parseDispatchAck(result.buffer.toString('utf8'), payload.message_id);
 }
 
 async function checkOutboundLeads() {
@@ -255,6 +272,16 @@ async function enrichVoiceMessage(message, contact) {
 
 function createPoller({ fetch = fetchGallabox, dispatch = sendToN8n, store, queue = new KeyedSerialQueue() } = {}) {
   let polling = false;
+  const contactCache = new Map();
+
+  async function getContact(conversation) {
+    if (getPhone(conversation?.contact)) return conversation.contact;
+    const cached = contactCache.get(conversation.contactId);
+    if (cached && Date.now() - cached.cachedAt < config.contactCacheTtlMs) return cached.contact;
+    const contact = await fetch(`/contacts/${conversation.contactId}`);
+    if (contact) contactCache.set(conversation.contactId, { contact, cachedAt: Date.now() });
+    return contact;
+  }
 
   async function processMessage(message, contact) {
     const contactId = message.contactId;
@@ -301,13 +328,24 @@ function createPoller({ fetch = fetchGallabox, dispatch = sendToN8n, store, queu
 
   async function scanConversation(conversation) {
     if (!conversation?.contactId) return;
-    const contact = await fetch(`/contacts/${conversation.contactId}`);
-    if (!contact) return;
 
     const messagesResponse = await fetch(`/messages?channelId=${encodeURIComponent(config.channelId)}&contactId=${encodeURIComponent(conversation.contactId)}&limit=${config.maxMessagesPerConversation}`);
     const messages = arrayFromApiResponse(messagesResponse)
       .filter(message => isInbound(message, conversation.contactId))
       .sort((a, b) => messageTimestamp(a) - messageTimestamp(b));
+
+    const hasProcessableMessage = messages.some(message => {
+      const existing = store.getMessage(getMessageId(message, conversation.contactId));
+      const age = Date.now() - messageTimestamp(message);
+      if (!existing && age <= config.seedAgeMs) return true;
+      if (existing?.status === 'failed' && Date.now() - new Date(existing.failedAt || 0).getTime() >= 10000) return true;
+      if (existing?.status === 'processing' && Date.now() - new Date(existing.updatedAt || 0).getTime() >= config.apiTimeoutMs * 2) return true;
+      return false;
+    });
+    if (!hasProcessableMessage) return;
+
+    const contact = await getContact(conversation);
+    if (!contact) return;
 
     for (const message of messages) {
       const messageId = getMessageId(message, conversation.contactId);
@@ -333,6 +371,8 @@ function createPoller({ fetch = fetchGallabox, dispatch = sendToN8n, store, queu
     try {
       const conversations = arrayFromApiResponse(await fetch(`/conversations?channelId=${encodeURIComponent(config.channelId)}&limit=${config.maxConversations}`));
       for (const conversation of conversations) {
+        const updatedAt = new Date(conversation?.updatedAt || conversation?.lastMessageAt || 0).getTime();
+        if (updatedAt && Date.now() - updatedAt > config.conversationLookbackMs) continue;
         await scanConversation(conversation).catch(error => {
           console.error(`Conversation scan failed: ${error.message}`);
         });
@@ -409,6 +449,7 @@ module.exports = {
   downloadMediaBuffer,
   isAllowedPhone,
   normalizeMessage,
+  parseDispatchAck,
   seedHistoricalMessages,
   transcribeVoiceNoteBuffer
 };

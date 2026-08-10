@@ -6,7 +6,7 @@ const path = require('path');
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
-const { createPoller } = require('./index');
+const { createPoller, parseDispatchAck } = require('./index');
 const { JsonStateStore } = require('./state_store');
 
 test('poller dispatches every new inbound message in order', async () => {
@@ -40,4 +40,14 @@ test('poller dispatches every new inbound message in order', async () => {
   assert.deepEqual(dispatched, ['msg-1', 'msg-2']);
   assert.equal(store.getMessage('msg-1').status, 'done');
   assert.equal(store.getMessage('msg-2').status, 'done');
+});
+
+test('accepts only an explicit matching n8n delivery acknowledgement', () => {
+  assert.deepEqual(
+    parseDispatchAck(JSON.stringify({ ok: true, message_id: 'msg-1', reply_sent: true }), 'msg-1'),
+    { ok: true, message_id: 'msg-1', reply_sent: true }
+  );
+  assert.throws(() => parseDispatchAck('', 'msg-1'), /non-JSON acknowledgement/);
+  assert.throws(() => parseDispatchAck(JSON.stringify({ ok: false, message_id: 'msg-1' }), 'msg-1'), /did not confirm/);
+  assert.throws(() => parseDispatchAck(JSON.stringify({ ok: true, message_id: 'msg-2' }), 'msg-1'), /message mismatch/);
 });
