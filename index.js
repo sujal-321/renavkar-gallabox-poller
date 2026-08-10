@@ -43,11 +43,13 @@ const config = {
   allowed: parseAllowedPhones(),
   pollIntervalMs: numberEnv('RENAVKAR_POLL_INTERVAL_MS', 15000, 1000),
   gallaboxRequestIntervalMs: numberEnv('RENAVKAR_GALLABOX_REQUEST_INTERVAL_MS', 1000, 0),
+  gallaboxRateLimitBackoffMs: numberEnv('RENAVKAR_GALLABOX_RATE_LIMIT_BACKOFF_MS', 60000, 1000),
   apiTimeoutMs: numberEnv('RENAVKAR_API_TIMEOUT_MS', 15000, 1000),
   maxAudioBytes: numberEnv('RENAVKAR_MAX_AUDIO_BYTES', 15 * 1024 * 1024, 1024),
   maxConversations: numberEnv('RENAVKAR_MAX_CONVERSATIONS', 5, 1),
   maxMessagesPerConversation: numberEnv('RENAVKAR_MAX_MESSAGES', 20, 1),
   seedAgeMs: numberEnv('RENAVKAR_SEED_AGE_MS', 120000, 0),
+  seedHistoryEnabled: process.env.RENAVKAR_SEED_HISTORY_ENABLED === 'true',
   stateFile: process.env.RENAVKAR_STATE_FILE || path.join(__dirname, 'data', 'renavkar-state.json'),
   stateRetentionMs: numberEnv('RENAVKAR_STATE_RETENTION_MS', 7 * 24 * 60 * 60 * 1000, 60000),
   outboundCheckEnabled: process.env.RENAVKAR_OUTBOUND_CHECK_ENABLED !== 'false'
@@ -97,15 +99,24 @@ function sleep(milliseconds) {
 
 function createThrottledFetch(fetchFn, intervalMs) {
   let lastRequestAt = 0;
+  let blockedUntil = 0;
   let chain = Promise.resolve();
 
   return (...args) => {
     const request = chain.then(async () => {
-      const waitMs = Math.max(0, intervalMs - (Date.now() - lastRequestAt));
+      const waitMs = Math.max(0, intervalMs - (Date.now() - lastRequestAt), blockedUntil - Date.now());
       if (waitMs) await sleep(waitMs);
-      const result = await fetchFn(...args);
-      lastRequestAt = Date.now();
-      return result;
+      try {
+        const result = await fetchFn(...args);
+        lastRequestAt = Date.now();
+        return result;
+      } catch (error) {
+        if (/HTTP 429/.test(error.message)) {
+          blockedUntil = Date.now() + config.gallaboxRateLimitBackoffMs;
+          console.error(`Gallabox rate limit reached; backing off for ${config.gallaboxRateLimitBackoffMs}ms`);
+        }
+        throw error;
+      }
     });
     chain = request.catch(() => undefined);
     return request;
@@ -353,11 +364,21 @@ async function main() {
   const store = new JsonStateStore(config.stateFile);
   store.load();
   const throttledFetch = createThrottledFetch(fetchGallabox, config.gallaboxRequestIntervalMs);
-  await seedHistoricalMessages(store, throttledFetch);
+  if (config.seedHistoryEnabled) {
+    try {
+      await seedHistoricalMessages(store, throttledFetch);
+    } catch (error) {
+      console.error(`Historical message seeding skipped: ${error.message}`);
+    }
+  }
 
   const poller = createPoller({ store, fetch: throttledFetch });
   console.log(`Renavkar poller active; interval=${config.pollIntervalMs}ms, Gallabox request interval=${config.gallaboxRequestIntervalMs}ms, state=${config.stateFile}`);
-  await poller.pollOnce();
+  try {
+    await poller.pollOnce();
+  } catch (error) {
+    console.error(`Initial polling cycle failed: ${error.message}`);
+  }
 
   const interval = setInterval(() => poller.pollOnce().catch(error => console.error(`Polling cycle failed: ${error.message}`)), config.pollIntervalMs);
   const outboundInterval = setInterval(() => checkOutboundLeads(), 60000);
