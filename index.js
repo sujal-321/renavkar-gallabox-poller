@@ -52,7 +52,8 @@ const config = {
   seedHistoryEnabled: process.env.RENAVKAR_SEED_HISTORY_ENABLED === 'true',
   stateFile: process.env.RENAVKAR_STATE_FILE || path.join(__dirname, 'data', 'renavkar-state.json'),
   stateRetentionMs: numberEnv('RENAVKAR_STATE_RETENTION_MS', 7 * 24 * 60 * 60 * 1000, 60000),
-  outboundCheckEnabled: process.env.RENAVKAR_OUTBOUND_CHECK_ENABLED !== 'false'
+  // Outbound campaigns must be explicitly enabled. Inbound bot testing must never message sheet leads by default.
+  outboundCheckEnabled: process.env.RENAVKAR_OUTBOUND_CHECK_ENABLED === 'true'
 };
 
 function validateConfig() {
