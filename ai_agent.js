@@ -1,7 +1,7 @@
-'use strict';
-
 const https = require('https');
 const { appendLeadToGoogleSheet } = require('./sheets_logger');
+const { sendDiscordAlert } = require('./discord_alerter');
+const { fetchSupabaseHistory, saveSupabaseMessage, getLocalHistory, addToLocalHistory } = require('./supabase_memory');
 
 const SYSTEM_PROMPT = `You are an AI Real Estate Advisor representing RENAVKAR, an independent realty consulting firm in Ahmedabad established in mid-2010. Renavkar helps customers BUY, SELL, RENT, LEASE, and INVEST across Residential and Commercial property. In this bot, the current campaign focus is the Avestia Stay investment project.
 
@@ -178,7 +178,7 @@ async function handleDirectAiMessage(payload, config) {
     throw new Error('Message text is empty');
   }
 
-  const history = getHistory(phone);
+  const history = await fetchSupabaseHistory(phone, config, 12);
   const messages = [
     { role: 'system', content: SYSTEM_PROMPT },
     ...history.map(h => ({ role: h.role, content: String(h.content || '') })),
@@ -187,7 +187,21 @@ async function handleDirectAiMessage(payload, config) {
 
   console.log(`🤖 [Direct AI] Generating reply for ${senderName} (+${phone}): "${userText}"`);
 
-  const rawAiReply = await callOpenAI(messages, config.openAiKey || process.env.OPENAI_API_KEY);
+  let rawAiReply;
+  try {
+    rawAiReply = await callOpenAI(messages, config.openAiKey || process.env.OPENAI_API_KEY);
+  } catch (err) {
+    sendDiscordAlert({
+      webhookUrl: config.discordWebhookUrl,
+      title: '🚨 OpenAI API Generation Failed',
+      description: `Failed to generate AI reply for **${senderName}** (\`+${phone}\`)`,
+      error: err.message,
+      phone,
+      level: 'error'
+    });
+    throw err;
+  }
+
   const cleanReply = String(rawAiReply).replace(/<lead_data>[\s\S]*?<\/lead_data>/g, '').trim();
 
   // Check if lead details were qualified
@@ -227,22 +241,34 @@ async function handleDirectAiMessage(payload, config) {
     }
   }
 
-  // Save to history
+  // Save to history (both in-memory and Supabase)
   if (phone) {
-    addToHistory(phone, 'user', userText);
-    addToHistory(phone, 'assistant', cleanReply);
+    saveSupabaseMessage(phone, 'user', userText, config);
+    saveSupabaseMessage(phone, 'assistant', cleanReply, config);
   }
 
   console.log(`📲 [Direct AI] Sending reply to +${phone}...`);
-  await sendGallaboxWhatsApp({
-    accountId: config.accountId || process.env.GALLABOX_ACCOUNT_ID,
-    apiKey: config.apiKey || process.env.GALLABOX_API_KEY,
-    apiSecret: config.apiSecret || process.env.GALLABOX_API_SECRET,
-    channelId: config.channelId || process.env.GALLABOX_CHANNEL_ID,
-    phone,
-    recipientName: senderName,
-    text: cleanReply
-  });
+  try {
+    await sendGallaboxWhatsApp({
+      accountId: config.accountId || process.env.GALLABOX_ACCOUNT_ID,
+      apiKey: config.apiKey || process.env.GALLABOX_API_KEY,
+      apiSecret: config.apiSecret || process.env.GALLABOX_API_SECRET,
+      channelId: config.channelId || process.env.GALLABOX_CHANNEL_ID,
+      phone,
+      recipientName: senderName,
+      text: cleanReply
+    });
+  } catch (err) {
+    sendDiscordAlert({
+      webhookUrl: config.discordWebhookUrl,
+      title: '🚨 Gallabox Delivery Failed',
+      description: `Failed to deliver WhatsApp message to **${senderName}** (\`+${phone}\`)`,
+      error: err.message,
+      phone,
+      level: 'error'
+    });
+    throw err;
+  }
 
   console.log(`✅ [Direct AI] Reply delivered successfully to +${phone}`);
   return {

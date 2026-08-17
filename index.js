@@ -22,6 +22,7 @@ const { KeyedSerialQueue } = require('./keyed_queue');
 const { JsonStateStore } = require('./state_store');
 const { MessageDebouncer } = require('./debouncer');
 const { processUncontactedLeads } = require('./outbound_dispatcher');
+const { sendDiscordAlert } = require('./discord_alerter');
 const {
   extractAudioUrl,
   getPhone,
@@ -58,6 +59,10 @@ const config = {
   n8nInternalSecret: process.env.N8N_INTERNAL_SECRET || '',
   allowed: parseAllowedPhones(),
   googleSheetWebhookUrl: process.env.GOOGLE_SHEET_WEBHOOK_URL || 'https://script.google.com/macros/s/AKfycbxkqQmgrTR3Wd7whI7Z-Fy2BhuUq43wB6q86nqHxWozWdKm_VDPF0nMZMTnlu7buyAh_w/exec',
+  discordWebhookUrl: process.env.DISCORD_WEBHOOK_URL || 'https://discord.com/api/webhooks/1538878377619103755/XdWLsC0g83LovfxxQi__hwMcn_r0PIIZdSwbsPIDaLKp8h3jIbOqmagS8M13fmNbENa3',
+  supabaseUrl: process.env.SUPABASE_URL || 'https://prgpmcfgpyqsjplndrtz.supabase.co',
+  supabaseKey: process.env.SUPABASE_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InByZ3BtY2ZncHlxc2pwbG5kcnR6Iiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc4Njk2NDE4NywiZXhwIjoyMTAyNTQwMTg3fQ.u0LwtrWGGKFoJOgxyn_sRWSU7LvOpbne2SRB2QHyuUA',
+  humanTakeoverTimeoutMs: numberEnv('RENAVKAR_HUMAN_TAKEOVER_TIMEOUT_MS', 30 * 60 * 1000, 60000),
   debounceMs: numberEnv('RENAVKAR_DEBOUNCE_MS', 5000, 0),
   pollIntervalMs: numberEnv('RENAVKAR_POLL_INTERVAL_MS', 3000, 1000),
   gallaboxRequestIntervalMs: numberEnv('RENAVKAR_GALLABOX_REQUEST_INTERVAL_MS', 1000, 0),
@@ -382,11 +387,14 @@ function createPoller({ fetch = fetchGallabox, dispatch = defaultDispatch, store
     }
   }
 
+  const humanTakeoverMap = new Map();
+
   async function scanConversation(conversation) {
     if (!conversation?.contactId) return;
 
     const messagesResponse = await fetch(`/messages?channelId=${encodeURIComponent(config.channelId)}&contactId=${encodeURIComponent(conversation.contactId)}&limit=${config.maxMessagesPerConversation}`);
-    const messages = arrayFromApiResponse(messagesResponse)
+    const allMessages = arrayFromApiResponse(messagesResponse);
+    const messages = allMessages
       .filter(message => isInbound(message, conversation.contactId))
       .sort((a, b) => messageTimestamp(a) - messageTimestamp(b));
 
@@ -395,6 +403,34 @@ function createPoller({ fetch = fetchGallabox, dispatch = defaultDispatch, store
 
     const phone = getPhone(contact);
     if (!phone || !isAllowedPhone(phone)) return;
+
+    // Human Takeover Detection: Check if human staff responded manually
+    for (const msg of allMessages) {
+      if (!isInbound(msg, conversation.contactId)) {
+        if (msg.user || msg.source === 'agent' || msg.source === 'inbox' || msg.senderType === 'user') {
+          const age = Date.now() - messageTimestamp(msg);
+          if (age < config.humanTakeoverTimeoutMs) {
+            const isFirstDetection = !humanTakeoverMap.has(phone);
+            humanTakeoverMap.set(phone, Date.now());
+            if (isFirstDetection) {
+              sendDiscordAlert({
+                webhookUrl: config.discordWebhookUrl,
+                title: '👤 Human Agent Takeover Active',
+                description: `Human staff message detected for **${contact.name || 'Investor'}** (\`+${phone}\`). AI bot paused for 30 minutes.`,
+                phone,
+                level: 'warn'
+              });
+            }
+          }
+        }
+      }
+    }
+
+    const lastHumanTakeover = humanTakeoverMap.get(phone);
+    if (lastHumanTakeover && Date.now() - lastHumanTakeover < config.humanTakeoverTimeoutMs) {
+      console.log(`[Human Takeover] Bot paused for ${phone} due to recent human activity`);
+      return;
+    }
 
     const pendingMessages = [];
     for (const message of messages) {
