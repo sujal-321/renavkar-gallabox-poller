@@ -21,6 +21,7 @@ for (const envFile of envLocations) {
 const { KeyedSerialQueue } = require('./keyed_queue');
 const { JsonStateStore } = require('./state_store');
 const { MessageDebouncer } = require('./debouncer');
+const { processUncontactedLeads } = require('./outbound_dispatcher');
 const {
   extractAudioUrl,
   getPhone,
@@ -56,7 +57,7 @@ const config = {
   n8nUrl: String(process.env.N8N_URL || 'https://n8n-production-e558.up.railway.app').replace(/\/$/, ''),
   n8nInternalSecret: process.env.N8N_INTERNAL_SECRET || '',
   allowed: parseAllowedPhones(),
-  googleSheetWebhookUrl: process.env.GOOGLE_SHEET_WEBHOOK_URL || 'https://script.google.com/macros/s/AKfycbw3UugpGHYdRBuJxUynJNuarNm7uI7SqsT9CJ1Ol_kCLK1-A-JGTiHxEFWqCDEjac0xLA/exec',
+  googleSheetWebhookUrl: process.env.GOOGLE_SHEET_WEBHOOK_URL || 'https://script.google.com/macros/s/AKfycbxkqQmgrTR3Wd7whI7Z-Fy2BhuUq43wB6q86nqHxWozWdKm_VDPF0nMZMTnlu7buyAh_w/exec',
   debounceMs: numberEnv('RENAVKAR_DEBOUNCE_MS', 5000, 0),
   pollIntervalMs: numberEnv('RENAVKAR_POLL_INTERVAL_MS', 3000, 1000),
   gallaboxRequestIntervalMs: numberEnv('RENAVKAR_GALLABOX_REQUEST_INTERVAL_MS', 1000, 0),
@@ -267,13 +268,12 @@ async function defaultDispatch(payload) {
 }
 
 async function checkOutboundLeads() {
-  if (!config.outboundCheckEnabled) return;
-  try {
-    await requestBuffer(`${config.n8nUrl}/webhook/renavkar-outbound-trigger`, {
-      headers: config.n8nInternalSecret ? { 'x-renavkar-internal-secret': config.n8nInternalSecret } : {}
-    });
-  } catch (error) {
-    console.error(`Outbound lead check failed: ${error.message}`);
+  if (config.googleSheetWebhookUrl) {
+    try {
+      await processUncontactedLeads(config);
+    } catch (error) {
+      console.error(`Outbound lead check failed: ${error.message}`);
+    }
   }
 }
 
@@ -474,12 +474,13 @@ async function main() {
   console.log(`Renavkar poller active; interval=${config.pollIntervalMs}ms, Gallabox request interval=${config.gallaboxRequestIntervalMs}ms, state=${config.stateFile}`);
   try {
     await poller.pollOnce();
+    await checkOutboundLeads();
   } catch (error) {
-    console.error(`Initial polling cycle failed: ${error.message}`);
+    console.error(`Initial polling/outbound cycle failed: ${error.message}`);
   }
 
   const interval = setInterval(() => poller.pollOnce().catch(error => console.error(`Polling cycle failed: ${error.message}`)), config.pollIntervalMs);
-  const outboundInterval = setInterval(() => checkOutboundLeads(), 60000);
+  const outboundInterval = setInterval(() => checkOutboundLeads(), 15000);
 
   const shutdown = () => {
     clearInterval(interval);
