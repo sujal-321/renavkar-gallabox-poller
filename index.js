@@ -20,6 +20,7 @@ for (const envFile of envLocations) {
 
 const { KeyedSerialQueue } = require('./keyed_queue');
 const { JsonStateStore } = require('./state_store');
+const { MessageDebouncer } = require('./debouncer');
 const {
   extractAudioUrl,
   getPhone,
@@ -55,6 +56,7 @@ const config = {
   n8nUrl: String(process.env.N8N_URL || 'https://n8n-production-e558.up.railway.app').replace(/\/$/, ''),
   n8nInternalSecret: process.env.N8N_INTERNAL_SECRET || '',
   allowed: parseAllowedPhones(),
+  debounceMs: numberEnv('RENAVKAR_DEBOUNCE_MS', 5000, 0),
   pollIntervalMs: numberEnv('RENAVKAR_POLL_INTERVAL_MS', 3000, 1000),
   gallaboxRequestIntervalMs: numberEnv('RENAVKAR_GALLABOX_REQUEST_INTERVAL_MS', 1000, 0),
   gallaboxRateLimitBackoffMs: numberEnv('RENAVKAR_GALLABOX_RATE_LIMIT_BACKOFF_MS', 60000, 1000),
@@ -296,9 +298,51 @@ async function enrichVoiceMessage(message, contact) {
   }
 }
 
-function createPoller({ fetch = fetchGallabox, dispatch = defaultDispatch, store, queue = new KeyedSerialQueue() } = {}) {
+function createPoller({ fetch = fetchGallabox, dispatch = defaultDispatch, store, queue = new KeyedSerialQueue(), debounceMs = config.debounceMs } = {}) {
   let polling = false;
   const contactCache = new Map();
+
+  const debouncer = new MessageDebouncer({
+    debounceMs,
+    onFlush: async (bundledPayload, contact, allMessageIds) => {
+      const phone = bundledPayload.sender_phone;
+      const primaryMessageId = bundledPayload.message_id;
+
+      return queue.run(phone, async () => {
+        try {
+          await dispatch({
+            event: 'message.received',
+            sender_phone: phone,
+            sender_name: bundledPayload.sender_name,
+            message_text: bundledPayload.message_text,
+            contact: { phone: `+${phone}`, name: bundledPayload.sender_name },
+            message: { text: bundledPayload.message_text },
+            message_id: primaryMessageId,
+            conversation_id: bundledPayload.conversation_id,
+            button_payload: bundledPayload.button_payload,
+            button_text: bundledPayload.button_text,
+            voice_note_status: bundledPayload.voice_note_status,
+            voice_note_transcription: bundledPayload.voice_note_transcription,
+            source: bundledPayload.source,
+            received_at: bundledPayload.received_at,
+            bundled_message_ids: allMessageIds
+          });
+
+          for (const id of allMessageIds) {
+            store.mark(id, { status: 'done', completedAt: new Date().toISOString() });
+          }
+          console.log(`Processed bundled messages [${allMessageIds.join(', ')}] for ${phone}`);
+          return { ok: true, message_id: primaryMessageId, reply_sent: true };
+        } catch (error) {
+          for (const id of allMessageIds) {
+            store.mark(id, { status: 'failed', lastError: error.message, failedAt: new Date().toISOString() });
+          }
+          console.error(`Dispatch failed for [${allMessageIds.join(', ')}]: ${error.message}`);
+          throw error;
+        }
+      });
+    }
+  });
 
   async function getContact(conversation) {
     if (getPhone(conversation?.contact)) return conversation.contact;
@@ -330,28 +374,10 @@ function createPoller({ fetch = fetchGallabox, dispatch = defaultDispatch, store
       lastError: ''
     });
 
-    try {
-      await dispatch({
-        event: 'message.received',
-        sender_phone: phone,
-        sender_name: normalized.sender_name,
-        message_text: normalized.message_text,
-        contact: { phone: `+${phone}`, name: normalized.sender_name },
-        message: { text: normalized.message_text },
-        message_id: normalized.message_id,
-        conversation_id: normalized.conversation_id,
-        button_payload: normalized.button_payload,
-        button_text: normalized.button_text,
-        voice_note_status: normalized.voice_note_status,
-        voice_note_transcription: normalized.voice_note_transcription,
-        source: normalized.source,
-        received_at: normalized.received_at
-      });
-      store.mark(messageId, { status: 'done', completedAt: new Date().toISOString() });
-      console.log(`Processed ${messageId} for ${phone}`);
-    } catch (error) {
-      store.mark(messageId, { status: 'failed', lastError: error.message, failedAt: new Date().toISOString() });
-      console.error(`Dispatch failed for ${messageId}: ${error.message}`);
+    if (debounceMs > 0) {
+      return debouncer.push(phone, normalized, contact);
+    } else {
+      return debouncer.onFlush(normalized, contact, [messageId]);
     }
   }
 
@@ -390,9 +416,9 @@ function createPoller({ fetch = fetchGallabox, dispatch = defaultDispatch, store
 
     if (pendingMessages.length === 0) return;
 
-    for (const message of pendingMessages) {
-      await queue.run(phone, () => processMessage({ ...message, contactId: conversation.contactId }, contact));
-    }
+    await Promise.all(
+      pendingMessages.map(message => processMessage({ ...message, contactId: conversation.contactId }, contact))
+    );
   }
 
   async function pollOnce() {
