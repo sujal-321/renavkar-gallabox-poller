@@ -56,6 +56,7 @@ const config = {
   n8nUrl: String(process.env.N8N_URL || 'https://n8n-production-e558.up.railway.app').replace(/\/$/, ''),
   n8nInternalSecret: process.env.N8N_INTERNAL_SECRET || '',
   allowed: parseAllowedPhones(),
+  googleSheetWebhookUrl: process.env.GOOGLE_SHEET_WEBHOOK_URL || 'https://script.google.com/macros/s/AKfycbw3UugpGHYdRBuJxUynJNuarNm7uI7SqsT9CJ1Ol_kCLK1-A-JGTiHxEFWqCDEjac0xLA/exec',
   debounceMs: numberEnv('RENAVKAR_DEBOUNCE_MS', 5000, 0),
   pollIntervalMs: numberEnv('RENAVKAR_POLL_INTERVAL_MS', 3000, 1000),
   gallaboxRequestIntervalMs: numberEnv('RENAVKAR_GALLABOX_REQUEST_INTERVAL_MS', 1000, 0),

@@ -1,6 +1,7 @@
 'use strict';
 
 const https = require('https');
+const { appendLeadToGoogleSheet } = require('./sheets_logger');
 
 const SYSTEM_PROMPT = `You are an AI Real Estate Advisor representing RENAVKAR, an independent realty consulting firm in Ahmedabad established in mid-2010. Renavkar helps customers BUY, SELL, RENT, LEASE, and INVEST across Residential and Commercial property. In this bot, the current campaign focus is the Avestia Stay investment project.
 
@@ -188,6 +189,43 @@ async function handleDirectAiMessage(payload, config) {
 
   const rawAiReply = await callOpenAI(messages, config.openAiKey || process.env.OPENAI_API_KEY);
   const cleanReply = String(rawAiReply).replace(/<lead_data>[\s\S]*?<\/lead_data>/g, '').trim();
+
+  // Check if lead details were qualified
+  const match = String(rawAiReply).match(/<lead_data>(.*?)<\/lead_data>/s);
+  if (match && match[1]) {
+    try {
+      const parsedLead = JSON.parse(match[1]);
+      const hasData = Boolean(
+        parsedLead.lead_name ||
+        parsedLead.budget ||
+        parsedLead.requirement ||
+        parsedLead.preferred_visit_date ||
+        (parsedLead.site_visit_interest && String(parsedLead.site_visit_interest).toLowerCase() === 'yes')
+      );
+
+      if (hasData) {
+        const webhookUrl = config.googleSheetWebhookUrl || process.env.GOOGLE_SHEET_WEBHOOK_URL;
+        if (webhookUrl) {
+          console.log(`📝 [Google Sheets] Logging qualified lead: ${parsedLead.lead_name || senderName} (+${phone})...`);
+          appendLeadToGoogleSheet(webhookUrl, {
+            lead_name: parsedLead.lead_name || senderName,
+            phone: phone,
+            budget: parsedLead.budget || 'N/A',
+            requirement: parsedLead.requirement || 'Studio / 1BHK',
+            preferred_payment_plan: parsedLead.preferred_payment_plan || 'Not specified',
+            site_visit_interest: parsedLead.site_visit_interest || 'Yes',
+            preferred_visit_date: parsedLead.preferred_visit_date || 'TBD'
+          }).then(() => {
+            console.log(`✅ [Google Sheets] Lead successfully logged for ${parsedLead.lead_name || senderName}`);
+          }).catch(err => {
+            console.error(`⚠️ [Google Sheets] Failed to log lead: ${err.message}`);
+          });
+        }
+      }
+    } catch (err) {
+      console.error(`Lead tag parse error: ${err.message}`);
+    }
+  }
 
   // Save to history
   if (phone) {
