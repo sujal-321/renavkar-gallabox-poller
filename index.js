@@ -55,16 +55,16 @@ const config = {
   n8nUrl: String(process.env.N8N_URL || 'https://n8n-production-e558.up.railway.app').replace(/\/$/, ''),
   n8nInternalSecret: process.env.N8N_INTERNAL_SECRET || '',
   allowed: parseAllowedPhones(),
-  pollIntervalMs: numberEnv('RENAVKAR_POLL_INTERVAL_MS', 15000, 1000),
+  pollIntervalMs: numberEnv('RENAVKAR_POLL_INTERVAL_MS', 3000, 1000),
   gallaboxRequestIntervalMs: numberEnv('RENAVKAR_GALLABOX_REQUEST_INTERVAL_MS', 1000, 0),
   gallaboxRateLimitBackoffMs: numberEnv('RENAVKAR_GALLABOX_RATE_LIMIT_BACKOFF_MS', 60000, 1000),
   apiTimeoutMs: numberEnv('RENAVKAR_API_TIMEOUT_MS', 15000, 1000),
   maxAudioBytes: numberEnv('RENAVKAR_MAX_AUDIO_BYTES', 15 * 1024 * 1024, 1024),
   maxConversations: numberEnv('RENAVKAR_MAX_CONVERSATIONS', 25, 1),
   maxMessagesPerConversation: numberEnv('RENAVKAR_MAX_MESSAGES', 20, 1),
-  conversationLookbackMs: numberEnv('RENAVKAR_CONVERSATION_LOOKBACK_MS', 5 * 60 * 1000, 60000),
+  conversationLookbackMs: numberEnv('RENAVKAR_CONVERSATION_LOOKBACK_MS', 60 * 60 * 1000, 60000),
   contactCacheTtlMs: numberEnv('RENAVKAR_CONTACT_CACHE_TTL_MS', 60 * 60 * 1000, 60000),
-  seedAgeMs: numberEnv('RENAVKAR_SEED_AGE_MS', 120000, 0),
+  seedAgeMs: numberEnv('RENAVKAR_SEED_AGE_MS', 60 * 60 * 1000, 0),
   seedHistoryEnabled: process.env.RENAVKAR_SEED_HISTORY_ENABLED === 'true',
   stateFile: process.env.RENAVKAR_STATE_FILE || path.join(__dirname, 'data', 'renavkar-state.json'),
   stateRetentionMs: numberEnv('RENAVKAR_STATE_RETENTION_MS', 7 * 24 * 60 * 60 * 1000, 60000),
@@ -252,7 +252,7 @@ async function sendToN8n(payload) {
 }
 
 async function defaultDispatch(payload) {
-  if (process.env.USE_DIRECT_AI === 'true' || !config.n8nUrl) {
+  if (process.env.USE_DIRECT_AI !== 'false') {
     return handleDirectAiMessage(payload, config);
   }
   try {
