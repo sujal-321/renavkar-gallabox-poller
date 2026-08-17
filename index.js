@@ -62,9 +62,9 @@ const config = {
   maxAudioBytes: numberEnv('RENAVKAR_MAX_AUDIO_BYTES', 15 * 1024 * 1024, 1024),
   maxConversations: numberEnv('RENAVKAR_MAX_CONVERSATIONS', 25, 1),
   maxMessagesPerConversation: numberEnv('RENAVKAR_MAX_MESSAGES', 20, 1),
-  conversationLookbackMs: numberEnv('RENAVKAR_CONVERSATION_LOOKBACK_MS', 60 * 60 * 1000, 60000),
+  conversationLookbackMs: numberEnv('RENAVKAR_CONVERSATION_LOOKBACK_MS', 5 * 60 * 1000, 60000),
   contactCacheTtlMs: numberEnv('RENAVKAR_CONTACT_CACHE_TTL_MS', 60 * 60 * 1000, 60000),
-  seedAgeMs: numberEnv('RENAVKAR_SEED_AGE_MS', 60 * 60 * 1000, 0),
+  seedAgeMs: numberEnv('RENAVKAR_SEED_AGE_MS', 120000, 0),
   seedHistoryEnabled: process.env.RENAVKAR_SEED_HISTORY_ENABLED === 'true',
   stateFile: process.env.RENAVKAR_STATE_FILE || path.join(__dirname, 'data', 'renavkar-state.json'),
   stateRetentionMs: numberEnv('RENAVKAR_STATE_RETENTION_MS', 7 * 24 * 60 * 60 * 1000, 60000),
@@ -363,33 +363,34 @@ function createPoller({ fetch = fetchGallabox, dispatch = defaultDispatch, store
       .filter(message => isInbound(message, conversation.contactId))
       .sort((a, b) => messageTimestamp(a) - messageTimestamp(b));
 
-    const hasProcessableMessage = messages.some(message => {
-      const existing = store.getMessage(getMessageId(message, conversation.contactId));
-      const age = Date.now() - messageTimestamp(message);
-      if (!existing && age <= config.seedAgeMs) return true;
-      if (existing?.status === 'failed' && Date.now() - new Date(existing.failedAt || 0).getTime() >= 10000) return true;
-      if (existing?.status === 'processing' && Date.now() - new Date(existing.updatedAt || 0).getTime() >= config.apiTimeoutMs * 2) return true;
-      return false;
-    });
-    if (!hasProcessableMessage) return;
-
     const contact = await getContact(conversation);
     if (!contact) return;
 
+    const phone = getPhone(contact);
+    if (!phone || !isAllowedPhone(phone)) return;
+
+    const pendingMessages = [];
     for (const message of messages) {
       const messageId = getMessageId(message, conversation.contactId);
       const existing = store.getMessage(messageId);
       const age = Date.now() - messageTimestamp(message);
 
+      if (existing?.status === 'done' || existing?.status === 'seeded') continue;
+
       if (!existing && age > config.seedAgeMs) {
         store.mark(messageId, { status: 'seeded', createdAt: message.createdAt, contactId: conversation.contactId });
         continue;
       }
+
       if (existing?.status === 'processing' && Date.now() - new Date(existing.updatedAt).getTime() < config.apiTimeoutMs * 2) continue;
       if (existing?.status === 'failed' && Date.now() - new Date(existing.failedAt || 0).getTime() < 10000) continue;
 
-      const phone = getPhone(contact);
-      if (!phone || !isAllowedPhone(phone)) continue;
+      pendingMessages.push(message);
+    }
+
+    if (pendingMessages.length === 0) return;
+
+    for (const message of pendingMessages) {
       await queue.run(phone, () => processMessage({ ...message, contactId: conversation.contactId }, contact));
     }
   }
