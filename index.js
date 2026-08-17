@@ -5,6 +5,19 @@ const http = require('http');
 const https = require('https');
 const path = require('path');
 
+// Auto-load .env from current or parent directory
+const envLocations = [path.join(__dirname, '.env'), path.join(__dirname, '..', '.env')];
+for (const envFile of envLocations) {
+  if (fs.existsSync(envFile)) {
+    for (const line of fs.readFileSync(envFile, 'utf8').split(/\r?\n/)) {
+      const match = line.match(/^\s*([^#=]+)=(.*)$/);
+      if (!match) continue;
+      const name = match[1].trim();
+      if (!process.env[name]) process.env[name] = match[2].trim();
+    }
+  }
+}
+
 const { KeyedSerialQueue } = require('./keyed_queue');
 const { JsonStateStore } = require('./state_store');
 const {
@@ -14,6 +27,7 @@ const {
   isInbound,
   normalizeMessage
 } = require('./message_utils');
+const { handleDirectAiMessage } = require('./ai_agent');
 
 function numberEnv(name, fallback, minimum = 0) {
   const value = Number(process.env[name]);
@@ -237,6 +251,18 @@ async function sendToN8n(payload) {
   return parseDispatchAck(result.buffer.toString('utf8'), payload.message_id);
 }
 
+async function defaultDispatch(payload) {
+  if (process.env.USE_DIRECT_AI === 'true' || !config.n8nUrl) {
+    return handleDirectAiMessage(payload, config);
+  }
+  try {
+    return await sendToN8n(payload);
+  } catch (err) {
+    console.warn(`[Poller] n8n dispatch failed (${err.message}). Seamlessly executing Direct AI Agent...`);
+    return await handleDirectAiMessage(payload, config);
+  }
+}
+
 async function checkOutboundLeads() {
   if (!config.outboundCheckEnabled) return;
   try {
@@ -270,7 +296,7 @@ async function enrichVoiceMessage(message, contact) {
   }
 }
 
-function createPoller({ fetch = fetchGallabox, dispatch = sendToN8n, store, queue = new KeyedSerialQueue() } = {}) {
+function createPoller({ fetch = fetchGallabox, dispatch = defaultDispatch, store, queue = new KeyedSerialQueue() } = {}) {
   let polling = false;
   const contactCache = new Map();
 
@@ -307,6 +333,9 @@ function createPoller({ fetch = fetchGallabox, dispatch = sendToN8n, store, queu
     try {
       await dispatch({
         event: 'message.received',
+        sender_phone: phone,
+        sender_name: normalized.sender_name,
+        message_text: normalized.message_text,
         contact: { phone: `+${phone}`, name: normalized.sender_name },
         message: { text: normalized.message_text },
         message_id: normalized.message_id,
@@ -448,6 +477,7 @@ module.exports = {
   createThrottledFetch,
   downloadMediaBuffer,
   isAllowedPhone,
+  main,
   normalizeMessage,
   parseDispatchAck,
   seedHistoricalMessages,
