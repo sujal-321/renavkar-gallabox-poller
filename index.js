@@ -86,9 +86,9 @@ const config = {
   humanTakeoverTimeoutMs: numberEnv('RENAVKAR_HUMAN_TAKEOVER_TIMEOUT_MS', 30 * 60 * 1000, 60000),
   debounceMs: process.env.RENAVKAR_DEBOUNCE_MS ? Number(process.env.RENAVKAR_DEBOUNCE_MS) : null,
   activePollIntervalMs: numberEnv('RENAVKAR_ACTIVE_POLL_INTERVAL_MS', 1000, 500),
-  idlePollIntervalMs: numberEnv('RENAVKAR_IDLE_POLL_INTERVAL_MS', 2500, 1000),
-  pollIntervalMs: numberEnv('RENAVKAR_POLL_INTERVAL_MS', 2500, 1000),
-  gallaboxRequestIntervalMs: numberEnv('RENAVKAR_GALLABOX_REQUEST_INTERVAL_MS', 500, 0),
+  idlePollIntervalMs: numberEnv('RENAVKAR_IDLE_POLL_INTERVAL_MS', 1500, 500),
+  pollIntervalMs: numberEnv('RENAVKAR_POLL_INTERVAL_MS', 1500, 500),
+  gallaboxRequestIntervalMs: numberEnv('RENAVKAR_GALLABOX_REQUEST_INTERVAL_MS', 250, 0),
   gallaboxRateLimitBackoffMs: numberEnv('RENAVKAR_GALLABOX_RATE_LIMIT_BACKOFF_MS', 60000, 1000),
   apiTimeoutMs: numberEnv('RENAVKAR_API_TIMEOUT_MS', 15000, 1000),
   maxAudioBytes: numberEnv('RENAVKAR_MAX_AUDIO_BYTES', 15 * 1024 * 1024, 1024),
@@ -412,7 +412,7 @@ function createPoller({ fetch = fetchGallabox, dispatch = defaultDispatch, store
       lastError: ''
     });
 
-    if (debounceMs > 0) {
+    if (debounceMs !== 0) {
       return debouncer.push(phone, normalized, contact);
     } else {
       return debouncer.onFlush(normalized, contact, [messageId]);
@@ -424,17 +424,17 @@ function createPoller({ fetch = fetchGallabox, dispatch = defaultDispatch, store
   async function scanConversation(conversation) {
     if (!conversation?.contactId) return;
 
-    const messagesResponse = await fetch(`/messages?channelId=${encodeURIComponent(config.channelId)}&contactId=${encodeURIComponent(conversation.contactId)}&limit=${config.maxMessagesPerConversation}`);
-    const allMessages = arrayFromApiResponse(messagesResponse);
-    const messages = allMessages
-      .filter(message => isInbound(message, conversation.contactId))
-      .sort((a, b) => messageTimestamp(a) - messageTimestamp(b));
-
     const contact = await getContact(conversation);
     if (!contact) return;
 
     const phone = getPhone(contact);
     if (!phone || !isAllowedPhone(phone)) return;
+
+    const messagesResponse = await fetch(`/messages?channelId=${encodeURIComponent(config.channelId)}&contactId=${encodeURIComponent(conversation.contactId)}&limit=${config.maxMessagesPerConversation}`);
+    const allMessages = arrayFromApiResponse(messagesResponse);
+    const messages = allMessages
+      .filter(message => isInbound(message, conversation.contactId))
+      .sort((a, b) => messageTimestamp(a) - messageTimestamp(b));
 
     // Human Takeover Detection: Check if human staff responded manually
     for (const msg of allMessages) {
@@ -498,9 +498,24 @@ function createPoller({ fetch = fetchGallabox, dispatch = defaultDispatch, store
     polling = true;
     try {
       const conversations = arrayFromApiResponse(await fetch(`/conversations?channelId=${encodeURIComponent(config.channelId)}&limit=${config.maxConversations}`));
+      
+      // Sort newest conversations first so active messages are discovered in the first 50ms
+      conversations.sort((a, b) => {
+        const timeA = new Date(a?.updatedAt || a?.lastMessageAt || 0).getTime();
+        const timeB = new Date(b?.updatedAt || b?.lastMessageAt || 0).getTime();
+        return timeB - timeA;
+      });
+
       for (const conversation of conversations) {
         const updatedAt = new Date(conversation?.updatedAt || conversation?.lastMessageAt || 0).getTime();
         if (updatedAt && Date.now() - updatedAt > config.conversationLookbackMs) continue;
+
+        // Fast-path whitelist filter before fetching messages
+        const contactPhone = getPhone(conversation?.contact) || getPhone(contactCache.get(conversation?.contactId)?.contact);
+        if (contactPhone && !isAllowedPhone(contactPhone)) {
+          continue;
+        }
+
         await scanConversation(conversation).catch(error => {
           console.error(`Conversation scan failed: ${error.message}`);
         });
