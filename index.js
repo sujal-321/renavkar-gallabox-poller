@@ -44,9 +44,27 @@ function requiredEnv(name) {
 }
 
 function parseAllowedPhones() {
-  const raw = String(process.env.RENAVKAR_ALLOWED_PHONES || '9014998200,9714991000').trim();
-  if (raw === '*') return { allowAll: true, phones: [] };
-  return { allowAll: false, phones: raw.split(',').map(value => value.replace(/[^0-9]/g, '')).filter(Boolean) };
+  const rawEnv = process.env.RENAVKAR_ALLOWED_PHONES || process.env.ALLOWED_PHONES || '';
+  const devPhone = process.env.DEV_PHONE || '';
+  const defaultTestPhones = ['9014998200', '9714991000'];
+
+  if (rawEnv.trim() === '*' || process.env.ALLOW_ALL_PHONES === 'true') {
+    return { allowAll: true, phones: [] };
+  }
+
+  // Merge explicitly provided envs with the default test numbers (Sujal + Arihant)
+  const rawList = `${rawEnv},${devPhone},${defaultTestPhones.join(',')}`;
+  const phoneSet = new Set();
+  for (const part of rawList.split(',')) {
+    const cleaned = String(part || '').replace(/[^0-9]/g, '');
+    if (cleaned.length >= 10) {
+      phoneSet.add(cleaned.slice(-10));
+    } else if (cleaned) {
+      phoneSet.add(cleaned);
+    }
+  }
+
+  return { allowAll: false, phones: Array.from(phoneSet) };
 }
 
 const config = {
@@ -71,9 +89,9 @@ const config = {
   maxAudioBytes: numberEnv('RENAVKAR_MAX_AUDIO_BYTES', 15 * 1024 * 1024, 1024),
   maxConversations: numberEnv('RENAVKAR_MAX_CONVERSATIONS', 25, 1),
   maxMessagesPerConversation: numberEnv('RENAVKAR_MAX_MESSAGES', 20, 1),
-  conversationLookbackMs: numberEnv('RENAVKAR_CONVERSATION_LOOKBACK_MS', 5 * 60 * 1000, 60000),
+  conversationLookbackMs: numberEnv('RENAVKAR_CONVERSATION_LOOKBACK_MS', 10 * 60 * 1000, 60000),
   contactCacheTtlMs: numberEnv('RENAVKAR_CONTACT_CACHE_TTL_MS', 60 * 60 * 1000, 60000),
-  seedAgeMs: numberEnv('RENAVKAR_SEED_AGE_MS', 120000, 0),
+  seedAgeMs: numberEnv('RENAVKAR_SEED_AGE_MS', 15 * 60 * 1000, 0),
   seedHistoryEnabled: process.env.RENAVKAR_SEED_HISTORY_ENABLED === 'true',
   stateFile: process.env.RENAVKAR_STATE_FILE || path.join(__dirname, 'data', 'renavkar-state.json'),
   stateRetentionMs: numberEnv('RENAVKAR_STATE_RETENTION_MS', 7 * 24 * 60 * 60 * 1000, 60000),
@@ -219,7 +237,15 @@ function arrayFromApiResponse(value) {
 }
 
 function isAllowedPhone(phone) {
-  return config.allowed.allowAll || config.allowed.phones.some(allowed => phone.includes(allowed));
+  if (config.allowed.allowAll) return true;
+  const clean = String(phone || '').replace(/[^0-9]/g, '');
+  if (!clean) return false;
+  const last10 = clean.length >= 10 ? clean.slice(-10) : clean;
+  return config.allowed.phones.some(allowed => {
+    const allowedClean = String(allowed).replace(/[^0-9]/g, '');
+    const allowedLast10 = allowedClean.length >= 10 ? allowedClean.slice(-10) : allowedClean;
+    return clean === allowedClean || clean.includes(allowedClean) || last10 === allowedLast10;
+  });
 }
 
 function messageTimestamp(message) {

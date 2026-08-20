@@ -86,7 +86,13 @@ async function processUncontactedLeads(config) {
       if (!phone) continue;
 
       // Whitelist check
-      if (!config.allowed.allowAll && !config.allowed.phones.some(allowed => phone.includes(allowed))) {
+      const last10 = phone.length >= 10 ? phone.slice(-10) : phone;
+      const isAllowed = config.allowed.allowAll || config.allowed.phones.some(allowed => {
+        const allowedClean = String(allowed).replace(/[^0-9]/g, '');
+        const allowedLast10 = allowedClean.length >= 10 ? allowedClean.slice(-10) : allowedClean;
+        return phone === allowedClean || phone.includes(allowedClean) || last10 === allowedLast10;
+      });
+      if (!isAllowed) {
         continue;
       }
 

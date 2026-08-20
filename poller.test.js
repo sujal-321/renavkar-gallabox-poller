@@ -88,3 +88,22 @@ test('accepts only an explicit matching n8n delivery acknowledgement', () => {
   assert.throws(() => parseDispatchAck(JSON.stringify({ ok: false, message_id: 'msg-1' }), 'msg-1'), /did not confirm/);
   assert.throws(() => parseDispatchAck(JSON.stringify({ ok: true, message_id: 'msg-2' }), 'msg-1'), /message mismatch/);
 });
+
+test('whitelists both Sujal (9014998200) and Arihant (9714991000) test numbers across format variations', () => {
+  const { isAllowedPhone } = require('./index');
+  // Sujal formats
+  assert.equal(isAllowedPhone('9014998200'), true);
+  assert.equal(isAllowedPhone('919014998200'), true);
+  assert.equal(isAllowedPhone('+919014998200'), true);
+  assert.equal(isAllowedPhone('+91 90149-98200'), true);
+
+  // Arihant formats
+  assert.equal(isAllowedPhone('9714991000'), true);
+  assert.equal(isAllowedPhone('919714991000'), true);
+  assert.equal(isAllowedPhone('+919714991000'), true);
+  assert.equal(isAllowedPhone('+91 97149 91000'), true);
+
+  // Non-test random number is rejected
+  assert.equal(isAllowedPhone('9898123456'), false);
+  assert.equal(isAllowedPhone('+919898123456'), false);
+});
