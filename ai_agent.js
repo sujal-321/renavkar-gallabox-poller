@@ -3,7 +3,24 @@ const { appendLeadToGoogleSheet } = require('./sheets_logger');
 const { sendDiscordAlert } = require('./discord_alerter');
 const { fetchSupabaseHistory, saveSupabaseMessage, getLocalHistory, addToLocalHistory } = require('./supabase_memory');
 
-const SYSTEM_PROMPT = `You are an AI Real Estate Advisor representing RENAVKAR, an independent realty consulting firm in Ahmedabad established in mid-2010. Renavkar helps customers BUY, SELL, RENT, LEASE, and INVEST across Residential and Commercial property. In this bot, the current campaign focus is the Avestia Stay investment project.
+function getSystemPrompt() {
+  const nowIST = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
+  const formattedNow = nowIST.toLocaleString('en-IN', {
+    timeZone: 'Asia/Kolkata',
+    weekday: 'long',
+    day: 'numeric',
+    month: 'long',
+    year: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: true
+  });
+
+  return `You are an AI Real Estate Advisor representing RENAVKAR, an independent realty consulting firm in Ahmedabad established in mid-2010. Renavkar helps customers BUY, SELL, RENT, LEASE, and INVEST across Residential and Commercial property. In this bot, the current campaign focus is the Avestia Stay investment project.
+
+## 🕒 CURRENT SYSTEM TIME (ASIA/KOLKATA - IST)
+Current Date & Time: ${formattedNow} (IST).
+Use this real-time clock to resolve relative dates. When an investor mentions "tomorrow 5pm", "this Saturday 4pm", "next Monday", convert it to the exact calendar date format: DD/MM/YYYY, hh:mm A (e.g. 21/08/2026, 05:00 PM).
 
 ## 🚫 CRITICAL RULES & BOUNDARIES
 1. **INTERMEDIARY / CHANNEL PARTNER ONLY**: Renavkar Real Estate is an independent intermediary, broker, and channel partner — NOT the builder or developer. Do not present Renavkar as the project owner, developer, seller, or operator.
@@ -41,17 +58,207 @@ const SYSTEM_PROMPT = `You are an AI Real Estate Advisor representing RENAVKAR, 
 - **Brochure PDF**: https://drive.google.com/uc?export=download&id=1ilA69U8h50An9e4g4q880zKI-2-Rfkf4
 - **Renavkar office**: A-503 Safal Pegasus, 100 Ft Prahlad Nagar Road, opposite Shell Petrol Pump, Satellite, Ahmedabad 380015. Office: 079-40064848. Email: arihant@re-navkar.com.
 
-## 📥 LEAD QUALIFICATION PROTOCOL
-When an investor provides their name, requirement, budget, or requests a site visit, answer warmly and ALWAYS append this hidden XML tag at the VERY END of your message:
-<lead_data>{"lead_name":"[Name]","budget":"[Budget]","requirement":"[Studio/1BHK]","preferred_payment_plan":"[Plan]","site_visit_interest":"[Yes/No]","preferred_visit_date":"[Date/Time]"}</lead_data>
+## 📥 STRICT LEAD QUALIFICATION PROTOCOL
+You must ONLY qualify a lead and append the <lead_data> tag when the customer has provided their details AND explicitly confirmed interest in a site visit or appointment.
+Do NOT output <lead_data> for general inquiries, exploratory browsing, or if the user says "No" / is undecided.
 
-Do NOT output this tag unless qualifying lead details. Assure the investor that Owner Arihant Bhura (+91 97149 91000) will follow up.
+When ALL qualification criteria are met (Requirement/Budget known + Site visit explicitly agreed + Visit Date/Time specified):
+Append this hidden XML tag at the VERY END of your message:
+<lead_data>{"lead_name":"[Name]","budget":"[Budget]","requirement":"[Studio/1BHK]","preferred_payment_plan":"[Plan]","site_visit_interest":"Yes","preferred_visit_date":"DD/MM/YYYY, hh:mm A"}</lead_data>
+
+Do NOT output <lead_data> unless ALL criteria are met and site_visit_interest is "Yes". Assure the investor that Owner Arihant Bhura (+91 97149 91000) will follow up.
 
 ## VOICE NOTES AND BUTTONS
 - If the message begins with [Voice Note Transcribed], answer the transcribed question normally.
 - If voice_note_status is failed or the message says the voice note could not be transcribed, apologize briefly and ask the customer to send text or call Arihant.
-- If the customer clicks schedule_call or says they want a call/site visit, ask for their preferred date and time and qualify the lead.
+- If the customer clicks schedule_call or says they want a call/site visit, ask for their preferred date and time.
 - If the customer clicks not_interested, acknowledge the choice politely, do not sell further, and do not ask for more lead details.`;
+}
+
+const SYSTEM_PROMPT = getSystemPrompt();
+
+// In-memory qualified lead deduplication cache
+const loggedLeadsCache = new Map(); // phone -> { fingerprint, visitDate, timestamp, data }
+
+function formatToISTStandard(d, hours = 11, minutes = 0) {
+  const target = new Date(d);
+  target.setHours(hours, minutes, 0, 0);
+  
+  const day = String(target.getDate()).padStart(2, '0');
+  const month = String(target.getMonth() + 1).padStart(2, '0');
+  const year = target.getFullYear();
+  
+  let h = target.getHours();
+  const ampm = h >= 12 ? 'PM' : 'AM';
+  h = h % 12;
+  h = h ? h : 12;
+  const strHours = String(h).padStart(2, '0');
+  const strMinutes = String(target.getMinutes()).padStart(2, '0');
+  
+  return `${day}/${month}/${year}, ${strHours}:${strMinutes} ${ampm}`;
+}
+
+function parseTime(timeStr) {
+  if (!timeStr) return { hours: 11, minutes: 0 };
+  const match = timeStr.match(/(\d{1,2})(?::(\d{2}))?\s*(am|pm)?/i);
+  if (!match) return { hours: 11, minutes: 0 };
+  
+  let hours = parseInt(match[1], 10);
+  const minutes = match[2] ? parseInt(match[2], 10) : 0;
+  const modifier = match[3] ? match[3].toLowerCase() : null;
+  
+  if (modifier === 'pm' && hours < 12) hours += 12;
+  if (modifier === 'am' && hours === 12) hours = 0;
+  if (!modifier && hours >= 1 && hours <= 7) hours += 12;
+  
+  return { hours, minutes };
+}
+
+function normalizeVisitDateTime(dateStr, baseDate = new Date()) {
+  if (!dateStr || typeof dateStr !== 'string') return '';
+  const str = dateStr.trim();
+  if (/^tbd$|^n\/?a$|^not\s*specified$|^none$|^null$|^undefined$/i.test(str)) return '';
+  
+  // Check if it's already in DD/MM/YYYY, hh:mm AM/PM format
+  const alreadyFormatted = str.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})(?:,\s*|\s+)(\d{1,2}:\d{2}\s*(?:AM|PM|am|pm))$/i);
+  if (alreadyFormatted) {
+    const d = String(alreadyFormatted[1]).padStart(2, '0');
+    const m = String(alreadyFormatted[2]).padStart(2, '0');
+    const y = alreadyFormatted[3];
+    const time = alreadyFormatted[4].toUpperCase();
+    return `${d}/${m}/${y}, ${time}`;
+  }
+
+  // Get current date components in IST
+  const now = new Date(baseDate.toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
+  const lower = str.toLowerCase();
+  
+  const timeInfo = parseTime(str);
+
+  if (lower.includes('today')) {
+    return formatToISTStandard(now, timeInfo.hours, timeInfo.minutes);
+  }
+  
+  if (lower.includes('day after tomorrow')) {
+    const target = new Date(now);
+    target.setDate(target.getDate() + 2);
+    return formatToISTStandard(target, timeInfo.hours, timeInfo.minutes);
+  }
+
+  if (lower.includes('tomorrow') || lower.includes('tommorow') || lower.includes('tomrw')) {
+    const target = new Date(now);
+    target.setDate(target.getDate() + 1);
+    return formatToISTStandard(target, timeInfo.hours, timeInfo.minutes);
+  }
+
+  // Day of week handling
+  const days = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
+  for (let i = 0; i < days.length; i++) {
+    if (lower.includes(days[i])) {
+      const currentDay = now.getDay();
+      let diff = i - currentDay;
+      if (diff <= 0) diff += 7;
+      const target = new Date(now);
+      target.setDate(target.getDate() + diff);
+      return formatToISTStandard(target, timeInfo.hours, timeInfo.minutes);
+    }
+  }
+
+  // Check if string contains ISO or standard numeric format e.g. "2023-10-04 17:00:00"
+  const isoMatch = str.match(/(\d{4})-(\d{2})-(\d{2})(?:[T\s](\d{2}):(\d{2}))?/);
+  if (isoMatch) {
+    let year = parseInt(isoMatch[1], 10);
+    const month = parseInt(isoMatch[2], 10) - 1;
+    const day = parseInt(isoMatch[3], 10);
+    const h = isoMatch[4] ? parseInt(isoMatch[4], 10) : timeInfo.hours;
+    const m = isoMatch[5] ? parseInt(isoMatch[5], 10) : timeInfo.minutes;
+    
+    if (year < now.getFullYear()) {
+      year = now.getFullYear();
+    }
+    const target = new Date(year, month, day, h, m);
+    return formatToISTStandard(target, h, m);
+  }
+
+  const parsed = Date.parse(str);
+  if (!isNaN(parsed)) {
+    const parsedDate = new Date(parsed);
+    if (parsedDate.getFullYear() < now.getFullYear()) {
+      parsedDate.setFullYear(now.getFullYear());
+    }
+    return formatToISTStandard(parsedDate, parsedDate.getHours() || timeInfo.hours, parsedDate.getMinutes() || timeInfo.minutes);
+  }
+
+  return str;
+}
+
+function isQualifiedLead(lead) {
+  if (!lead || typeof lead !== 'object') return false;
+
+  // 1. Must have explicit confirmation of interest in visit/consultation
+  const interest = String(lead.site_visit_interest || '').trim().toLowerCase();
+  const hasInterest = interest === 'yes' || interest === 'true' || interest === 'interested' || interest === 'schedule';
+  if (!hasInterest) return false;
+
+  // 2. Must have a real preferred visit date & time (not TBD, not N/A, not empty)
+  const rawDate = String(lead.preferred_visit_date || '').trim();
+  if (!rawDate || /^tbd$|^n\/?a$|^not\s*specified$|^none$|^null$|^undefined$/i.test(rawDate)) {
+    return false;
+  }
+
+  // 3. Must have requirement or budget provided
+  const req = String(lead.requirement || '').trim();
+  const budget = String(lead.budget || '').trim();
+  const hasRequirement = Boolean(req && !/^not\s*specified$|^n\/?a$|^none$|^undefined$/i.test(req));
+  const hasBudget = Boolean(budget && !/^not\s*specified$|^n\/?a$|^none$|^undefined$/i.test(budget));
+  if (!hasRequirement && !hasBudget) {
+    return false;
+  }
+
+  return true;
+}
+
+function getLeadFingerprint(phone, leadData) {
+  const cleanPhone = String(phone).replace(/[^0-9]/g, '').slice(-10);
+  const req = String(leadData.requirement || '').trim().toLowerCase();
+  const budget = String(leadData.budget || '').trim().toLowerCase();
+  const visitDate = String(leadData.preferred_visit_date || '').trim().toLowerCase();
+  return `${cleanPhone}_${req}_${budget}_${visitDate}`;
+}
+
+function isLeadDuplicate(phone, leadData, windowMs = 24 * 60 * 60 * 1000) {
+  const cleanPhone = String(phone).replace(/[^0-9]/g, '').slice(-10);
+  if (!cleanPhone) return false;
+
+  const fingerprint = getLeadFingerprint(cleanPhone, leadData);
+  const existing = loggedLeadsCache.get(cleanPhone);
+
+  if (existing) {
+    const isWithinWindow = Date.now() - existing.timestamp < windowMs;
+    if (isWithinWindow && (existing.fingerprint === fingerprint || existing.visitDate === String(leadData.preferred_visit_date || '').trim())) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function recordLoggedLead(phone, leadData) {
+  const cleanPhone = String(phone).replace(/[^0-9]/g, '').slice(-10);
+  if (!cleanPhone) return;
+
+  const fingerprint = getLeadFingerprint(cleanPhone, leadData);
+  loggedLeadsCache.set(cleanPhone, {
+    fingerprint,
+    visitDate: String(leadData.preferred_visit_date || '').trim(),
+    timestamp: Date.now(),
+    data: leadData
+  });
+}
+
+function clearLoggedLeadsCache() {
+  loggedLeadsCache.clear();
+}
 
 const conversationHistory = new Map();
 
@@ -65,7 +272,6 @@ function getHistory(phone) {
 function addToHistory(phone, role, content) {
   const history = getHistory(phone);
   history.push({ role, content, timestamp: Date.now() });
-  // Keep last 12 messages in memory
   while (history.length > 12) {
     history.shift();
   }
@@ -188,8 +394,9 @@ async function handleDirectAiMessage(payload, config) {
   }
 
   const history = await fetchSupabaseHistory(phone, config, 12);
+  const currentPrompt = getSystemPrompt();
   const messages = [
-    { role: 'system', content: SYSTEM_PROMPT },
+    { role: 'system', content: currentPrompt },
     ...history.map(h => ({ role: h.role, content: String(h.content || '') })),
     { role: 'user', content: userText }
   ];
@@ -218,32 +425,41 @@ async function handleDirectAiMessage(payload, config) {
   if (match && match[1]) {
     try {
       const parsedLead = JSON.parse(match[1]);
-      const hasData = Boolean(
-        parsedLead.lead_name ||
-        parsedLead.budget ||
-        parsedLead.requirement ||
-        parsedLead.preferred_visit_date ||
-        (parsedLead.site_visit_interest && String(parsedLead.site_visit_interest).toLowerCase() === 'yes')
-      );
+      
+      // Normalize visit date & time
+      if (parsedLead.preferred_visit_date) {
+        parsedLead.preferred_visit_date = normalizeVisitDateTime(parsedLead.preferred_visit_date);
+      }
 
-      if (hasData) {
-        const webhookUrl = config.googleSheetWebhookUrl || process.env.GOOGLE_SHEET_WEBHOOK_URL;
-        if (webhookUrl) {
-          console.log(`📝 [Google Sheets] Logging qualified lead: ${parsedLead.lead_name || senderName} (+${phone})...`);
-          appendLeadToGoogleSheet(webhookUrl, {
-            lead_name: parsedLead.lead_name || senderName,
-            phone: phone,
-            budget: parsedLead.budget || 'N/A',
-            requirement: parsedLead.requirement || 'Studio / 1BHK',
-            preferred_payment_plan: parsedLead.preferred_payment_plan || 'Not specified',
-            site_visit_interest: parsedLead.site_visit_interest || 'Yes',
-            preferred_visit_date: parsedLead.preferred_visit_date || 'TBD'
-          }).then(() => {
-            console.log(`✅ [Google Sheets] Lead successfully logged for ${parsedLead.lead_name || senderName}`);
-          }).catch(err => {
-            console.error(`⚠️ [Google Sheets] Failed to log lead: ${err.message}`);
-          });
+      // Check strict qualification criteria
+      if (isQualifiedLead(parsedLead)) {
+        const leadPayload = {
+          lead_name: parsedLead.lead_name || senderName,
+          phone: phone,
+          budget: parsedLead.budget || 'N/A',
+          requirement: parsedLead.requirement || 'Studio / 1BHK',
+          preferred_payment_plan: parsedLead.preferred_payment_plan || 'Not specified',
+          site_visit_interest: parsedLead.site_visit_interest || 'Yes',
+          preferred_visit_date: parsedLead.preferred_visit_date
+        };
+
+        // Check for deduplication
+        if (!isLeadDuplicate(phone, leadPayload)) {
+          recordLoggedLead(phone, leadPayload);
+          const webhookUrl = config.googleSheetWebhookUrl || process.env.GOOGLE_SHEET_WEBHOOK_URL;
+          if (webhookUrl) {
+            console.log(`📝 [Google Sheets] Logging qualified lead: ${leadPayload.lead_name} (+${phone}) with Visit: "${leadPayload.preferred_visit_date}"...`);
+            appendLeadToGoogleSheet(webhookUrl, leadPayload).then(() => {
+              console.log(`✅ [Google Sheets] Lead successfully logged for ${leadPayload.lead_name}`);
+            }).catch(err => {
+              console.error(`⚠️ [Google Sheets] Failed to log lead: ${err.message}`);
+            });
+          }
+        } else {
+          console.log(`⏭️ [Google Sheets] Skipping duplicate lead recording for ${senderName} (+${phone}) - already logged in this window`);
         }
+      } else {
+        console.log(`ℹ️ [Direct AI] Lead data emitted but not fully qualified yet (Interest: ${parsedLead.site_visit_interest}, Date: ${parsedLead.preferred_visit_date}) - skipped Google Sheets write`);
       }
     } catch (err) {
       console.error(`Lead tag parse error: ${err.message}`);
@@ -290,9 +506,18 @@ async function handleDirectAiMessage(payload, config) {
 
 module.exports = {
   SYSTEM_PROMPT,
+  getSystemPrompt,
+  formatToISTStandard,
+  parseTime,
+  normalizeVisitDateTime,
+  isQualifiedLead,
+  isLeadDuplicate,
+  recordLoggedLead,
+  clearLoggedLeadsCache,
   callOpenAI,
   sendGallaboxWhatsApp,
   handleDirectAiMessage,
   getHistory,
   addToHistory
 };
+
