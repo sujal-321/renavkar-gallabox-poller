@@ -67,6 +67,9 @@ function parseAllowedPhones() {
   return { allowAll: false, phones: Array.from(phoneSet) };
 }
 
+const keepAliveHttpAgent = new http.Agent({ keepAlive: true, maxSockets: 50, keepAliveMsecs: 30000 });
+const keepAliveHttpsAgent = new https.Agent({ keepAlive: true, maxSockets: 50, keepAliveMsecs: 30000 });
+
 const config = {
   accountId: process.env.GALLABOX_ACCOUNT_ID || '',
   apiKey: process.env.GALLABOX_API_KEY || '',
@@ -81,9 +84,11 @@ const config = {
   supabaseUrl: process.env.SUPABASE_URL || 'https://prgpmcfgpyqsjplndrtz.supabase.co',
   supabaseKey: process.env.SUPABASE_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InByZ3BtY2ZncHlxc2pwbG5kcnR6Iiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc4Njk2NDE4NywiZXhwIjoyMTAyNTQwMTg3fQ.u0LwtrWGGKFoJOgxyn_sRWSU7LvOpbne2SRB2QHyuUA',
   humanTakeoverTimeoutMs: numberEnv('RENAVKAR_HUMAN_TAKEOVER_TIMEOUT_MS', 30 * 60 * 1000, 60000),
-  debounceMs: numberEnv('RENAVKAR_DEBOUNCE_MS', 5000, 0),
-  pollIntervalMs: numberEnv('RENAVKAR_POLL_INTERVAL_MS', 3000, 1000),
-  gallaboxRequestIntervalMs: numberEnv('RENAVKAR_GALLABOX_REQUEST_INTERVAL_MS', 1000, 0),
+  debounceMs: process.env.RENAVKAR_DEBOUNCE_MS ? Number(process.env.RENAVKAR_DEBOUNCE_MS) : null,
+  activePollIntervalMs: numberEnv('RENAVKAR_ACTIVE_POLL_INTERVAL_MS', 1000, 500),
+  idlePollIntervalMs: numberEnv('RENAVKAR_IDLE_POLL_INTERVAL_MS', 2500, 1000),
+  pollIntervalMs: numberEnv('RENAVKAR_POLL_INTERVAL_MS', 2500, 1000),
+  gallaboxRequestIntervalMs: numberEnv('RENAVKAR_GALLABOX_REQUEST_INTERVAL_MS', 500, 0),
   gallaboxRateLimitBackoffMs: numberEnv('RENAVKAR_GALLABOX_RATE_LIMIT_BACKOFF_MS', 60000, 1000),
   apiTimeoutMs: numberEnv('RENAVKAR_API_TIMEOUT_MS', 15000, 1000),
   maxAudioBytes: numberEnv('RENAVKAR_MAX_AUDIO_BYTES', 15 * 1024 * 1024, 1024),
@@ -109,7 +114,8 @@ function requestBuffer(urlString, { method = 'GET', headers = {}, body = null, t
   return new Promise((resolve, reject) => {
     const url = new URL(urlString);
     const client = url.protocol === 'http:' ? http : https;
-    const request = client.request(url, { method, headers }, response => {
+    const agent = url.protocol === 'http:' ? keepAliveHttpAgent : keepAliveHttpsAgent;
+    const request = client.request(url, { method, headers, agent }, response => {
       const chunks = [];
       let total = 0;
 
@@ -479,6 +485,9 @@ function createPoller({ fetch = fetchGallabox, dispatch = defaultDispatch, store
 
     if (pendingMessages.length === 0) return;
 
+    // Track active inbound conversation for dynamic burst micro-polling
+    lastInboundActivityAt = Date.now();
+
     await Promise.all(
       pendingMessages.map(message => processMessage({ ...message, contactId: conversation.contactId }, contact))
     );
@@ -504,6 +513,8 @@ function createPoller({ fetch = fetchGallabox, dispatch = defaultDispatch, store
 
   return { pollOnce, processMessage, scanConversation };
 }
+
+let lastInboundActivityAt = 0;
 
 async function seedHistoricalMessages(store, fetchFn) {
   const conversations = arrayFromApiResponse(await fetchFn(`/conversations?channelId=${encodeURIComponent(config.channelId)}&limit=${config.maxConversations}`));
@@ -533,7 +544,7 @@ async function main() {
   }
 
   const poller = createPoller({ store, fetch: throttledFetch });
-  console.log(`Renavkar poller active; interval=${config.pollIntervalMs}ms, Gallabox request interval=${config.gallaboxRequestIntervalMs}ms, state=${config.stateFile}`);
+  console.log(`Renavkar poller active; burstInterval=${config.activePollIntervalMs}ms, idleInterval=${config.idlePollIntervalMs}ms, state=${config.stateFile}`);
   try {
     await poller.pollOnce();
     await checkOutboundLeads();
@@ -541,11 +552,27 @@ async function main() {
     console.error(`Initial polling/outbound cycle failed: ${error.message}`);
   }
 
-  const interval = setInterval(() => poller.pollOnce().catch(error => console.error(`Polling cycle failed: ${error.message}`)), config.pollIntervalMs);
+  let running = true;
+  let pollTimer = null;
+
+  async function scheduleNextPoll() {
+    if (!running) return;
+    try {
+      await poller.pollOnce();
+    } catch (error) {
+      console.error(`Polling cycle failed: ${error.message}`);
+    }
+    const isActive = Date.now() - lastInboundActivityAt < 90000;
+    const nextInterval = isActive ? config.activePollIntervalMs : config.idlePollIntervalMs;
+    pollTimer = setTimeout(scheduleNextPoll, nextInterval);
+  }
+
+  pollTimer = setTimeout(scheduleNextPoll, config.activePollIntervalMs);
   const outboundInterval = setInterval(() => checkOutboundLeads(), 15000);
 
   const shutdown = () => {
-    clearInterval(interval);
+    running = false;
+    if (pollTimer) clearTimeout(pollTimer);
     clearInterval(outboundInterval);
     store.save();
     process.exit(0);

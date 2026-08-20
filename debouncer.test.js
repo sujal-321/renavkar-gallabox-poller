@@ -66,3 +66,44 @@ test('debouncer keeps different phones separate and independent', async () => {
   assert.equal(dispatched.some(d => d.phone === '919014998200' && d.text === 'Hello from Sujal'), true);
   assert.equal(dispatched.some(d => d.phone === '919714991000' && d.text === 'Hello from Arihant'), true);
 });
+
+test('calculateAdaptiveDelay gives 0ms for buttons, 1200ms for questions, 1800ms for greetings', () => {
+  const { calculateAdaptiveDelay } = require('./debouncer');
+
+  // Button clicks -> 0ms
+  assert.equal(calculateAdaptiveDelay({ button_payload: 'schedule_call' }), 0);
+  assert.equal(calculateAdaptiveDelay({ button_text: 'Interested' }), 0);
+
+  // Transcribed voice notes -> 500ms
+  assert.equal(calculateAdaptiveDelay({ voice_note_status: 'transcribed', message_text: 'What is the price?' }), 500);
+
+  // Questions -> 1200ms
+  assert.equal(calculateAdaptiveDelay({ message_text: 'What is the price of 1BHK?' }), 1200);
+  assert.equal(calculateAdaptiveDelay({ message_text: 'Where is the project located exactly in Ahmedabad?' }), 1200);
+
+  // Short greeting -> 1800ms
+  assert.equal(calculateAdaptiveDelay({ message_text: 'hi' }), 1800);
+  assert.equal(calculateAdaptiveDelay({ message_text: 'hello' }), 1800);
+});
+
+test('debouncer dispatches button click immediately in adaptive mode', async () => {
+  const dispatched = [];
+  const debouncer = new MessageDebouncer({
+    onFlush: async (payload) => {
+      dispatched.push(payload);
+      return { ok: true };
+    }
+  });
+
+  const t0 = Date.now();
+  const res = await debouncer.push('919014998200', {
+    message_id: 'btn-1',
+    button_payload: 'schedule_call',
+    message_text: 'schedule_call'
+  }, { name: 'Sujal' });
+
+  const elapsed = Date.now() - t0;
+  assert.equal(res.ok, true);
+  assert.equal(dispatched.length, 1);
+  assert.ok(elapsed < 100, `Button dispatch should be immediate (<100ms), took ${elapsed}ms`);
+});

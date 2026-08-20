@@ -71,18 +71,26 @@ function addToHistory(phone, role, content) {
   }
 }
 
+const keepAliveAgent = new https.Agent({
+  keepAlive: true,
+  maxSockets: 50,
+  keepAliveMsecs: 30000
+});
+
 function callOpenAI(messages, apiKey) {
   return new Promise((resolve, reject) => {
     const payload = JSON.stringify({
       model: 'gpt-4o-mini',
       messages,
-      temperature: 0.2
+      temperature: 0.1,
+      max_tokens: 250
     });
 
     const req = https.request({
       hostname: 'api.openai.com',
       path: '/v1/chat/completions',
       method: 'POST',
+      agent: keepAliveAgent,
       headers: {
         'Authorization': `Bearer ${apiKey}`,
         'Content-Type': 'application/json',
@@ -132,6 +140,7 @@ function sendGallaboxWhatsApp({ accountId, apiKey, apiSecret, channelId, phone, 
       hostname: 'server.gallabox.com',
       path: `/devapi/accounts/${accountId}/messages/whatsapp`,
       method: 'POST',
+      agent: keepAliveAgent,
       headers: {
         'apiKey': apiKey,
         'apiSecret': apiSecret,
