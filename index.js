@@ -81,8 +81,8 @@ const config = {
   allowed: parseAllowedPhones(),
   googleSheetWebhookUrl: process.env.GOOGLE_SHEET_WEBHOOK_URL || 'https://script.google.com/macros/s/AKfycbxkqQmgrTR3Wd7whI7Z-Fy2BhuUq43wB6q86nqHxWozWdKm_VDPF0nMZMTnlu7buyAh_w/exec',
   discordWebhookUrl: process.env.DISCORD_WEBHOOK_URL || 'https://discord.com/api/webhooks/1538878377619103755/XdWLsC0g83LovfxxQi__hwMcn_r0PIIZdSwbsPIDaLKp8h3jIbOqmagS8M13fmNbENa3',
-  supabaseUrl: process.env.SUPABASE_URL || 'https://prgpmcfgpyqsjplndrtz.supabase.co',
-  supabaseKey: process.env.SUPABASE_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InByZ3BtY2ZncHlxc2pwbG5kcnR6Iiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc4Njk2NDE4NywiZXhwIjoyMTAyNTQwMTg3fQ.u0LwtrWGGKFoJOgxyn_sRWSU7LvOpbne2SRB2QHyuUA',
+  supabaseUrl: process.env.SUPABASE_URL || '',
+  supabaseKey: process.env.SUPABASE_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY || '',
   humanTakeoverTimeoutMs: numberEnv('RENAVKAR_HUMAN_TAKEOVER_TIMEOUT_MS', 30 * 60 * 1000, 60000),
   debounceMs: process.env.RENAVKAR_DEBOUNCE_MS ? Number(process.env.RENAVKAR_DEBOUNCE_MS) : null,
   activePollIntervalMs: numberEnv('RENAVKAR_ACTIVE_POLL_INTERVAL_MS', 1000, 500),
@@ -90,7 +90,7 @@ const config = {
   pollIntervalMs: numberEnv('RENAVKAR_POLL_INTERVAL_MS', 1500, 500),
   gallaboxRequestIntervalMs: numberEnv('RENAVKAR_GALLABOX_REQUEST_INTERVAL_MS', 250, 0),
   gallaboxRateLimitBackoffMs: numberEnv('RENAVKAR_GALLABOX_RATE_LIMIT_BACKOFF_MS', 60000, 1000),
-  apiTimeoutMs: numberEnv('RENAVKAR_API_TIMEOUT_MS', 15000, 1000),
+  apiTimeoutMs: numberEnv('RENAVKAR_API_TIMEOUT_MS', 5000, 1000),
   maxAudioBytes: numberEnv('RENAVKAR_MAX_AUDIO_BYTES', 15 * 1024 * 1024, 1024),
   maxConversations: numberEnv('RENAVKAR_MAX_CONVERSATIONS', 25, 1),
   maxMessagesPerConversation: numberEnv('RENAVKAR_MAX_MESSAGES', 20, 1),
@@ -107,6 +107,10 @@ const config = {
 function validateConfig() {
   for (const name of ['GALLABOX_ACCOUNT_ID', 'GALLABOX_API_KEY', 'GALLABOX_API_SECRET', 'GALLABOX_CHANNEL_ID', 'OPENAI_API_KEY']) {
     if (!process.env[name]) throw new Error(`Missing required environment variable: ${name}`);
+  }
+  if (!process.env.SUPABASE_URL) throw new Error('Missing required environment variable: SUPABASE_URL');
+  if (!process.env.SUPABASE_KEY && !process.env.SUPABASE_SERVICE_ROLE_KEY) {
+    throw new Error('Missing required environment variable: SUPABASE_KEY');
   }
 }
 
@@ -444,6 +448,7 @@ function createPoller({ fetch = fetchGallabox, dispatch = defaultDispatch, store
           if (age < config.humanTakeoverTimeoutMs) {
             const isFirstDetection = !humanTakeoverMap.has(phone);
             humanTakeoverMap.set(phone, Date.now());
+            if (isFirstDetection) debouncer.clearPhone(phone);
             if (isFirstDetection) {
               sendDiscordAlert({
                 webhookUrl: config.discordWebhookUrl,

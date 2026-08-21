@@ -1,10 +1,17 @@
 const https = require('https');
 const { appendLeadToGoogleSheet } = require('./sheets_logger');
 const { sendDiscordAlert } = require('./discord_alerter');
-const { fetchSupabaseHistory, saveSupabaseMessage, getLocalHistory, addToLocalHistory } = require('./supabase_memory');
+const {
+  fetchSupabaseHistory,
+  saveSupabaseMessage,
+  getLocalHistory,
+  addToLocalHistory,
+  fetchLeadState,
+  saveLeadState
+} = require('./supabase_memory');
 
-function getSystemPrompt() {
-  const nowIST = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
+function getSystemPrompt(leadState = null, now = new Date()) {
+  const nowIST = new Date(now.toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
   const formattedNow = nowIST.toLocaleString('en-IN', {
     timeZone: 'Asia/Kolkata',
     weekday: 'long',
@@ -15,12 +22,36 @@ function getSystemPrompt() {
     minute: '2-digit',
     hour12: true
   });
+  const hour = nowIST.getHours();
+  const nightHoursActive = hour >= 0 && hour < 5;
+  const verifiedState = leadState && typeof leadState === 'object'
+    ? `## 📋 VERIFIED CUSTOMER STATE
+Treat this database-backed state as authoritative. Never recalculate or replace an existing appointment from a relative phrase in the conversation.
+- Name: ${leadState.lead_name || 'Not specified'}
+- Requirement: ${leadState.requirement || 'Not specified'}
+- Budget: ${leadState.budget || 'Not specified'}
+- Appointment: ${leadState.preferred_visit_date || 'No active appointment'}
+- Status: ${leadState.status || 'UNKNOWN'}
+`
+    : `## 📋 VERIFIED CUSTOMER STATE
+No active lead state was found. Do not claim that an appointment exists; ask for the exact date and time when needed.
+`;
 
   return `You are an AI Real Estate Advisor representing RENAVKAR, an independent realty consulting firm in Ahmedabad established in mid-2010. Renavkar helps customers BUY, SELL, RENT, LEASE, and INVEST across Residential and Commercial property. In this bot, the current campaign focus is the Avestia Stay investment project.
 
 ## 🕒 CURRENT SYSTEM TIME (ASIA/KOLKATA - IST)
 Current Date & Time: ${formattedNow} (IST).
 Use this real-time clock to resolve relative dates. When an investor mentions "tomorrow 5pm", "this Saturday 4pm", "next Monday", convert it to the exact calendar date format: DD/MM/YYYY, hh:mm A (e.g. 21/08/2026, 05:00 PM).
+
+${verifiedState}
+
+## 📅 APPOINTMENT VERIFICATION & RELATIVE DATE RULES
+- A verified appointment date above is the source of truth for appointment-status questions.
+- If the verified appointment falls on the current IST calendar date, say it is scheduled for TODAY and include the exact date and time.
+- If the customer says "tomorrow" or another relative date that conflicts with the verified appointment, politely correct the customer using the verified date instead of creating a new date.
+- If the customer asks to change or cancel an appointment, confirm the requested change and emit exactly one lifecycle tag at the end of the reply.
+- Between 12:00 AM and 5:00 AM IST, set NIGHT_HOURS_ACTIVE: true in your reasoning and clarify whether "tomorrow" means the upcoming daylight hours or the following calendar day.
+NIGHT_HOURS_ACTIVE: ${nightHoursActive}
 
 ## 🚫 CRITICAL RULES & BOUNDARIES
 1. **INTERMEDIARY / CHANNEL PARTNER ONLY**: Renavkar Real Estate is an independent intermediary, broker, and channel partner — NOT the builder or developer. Do not present Renavkar as the project owner, developer, seller, or operator.
@@ -39,6 +70,7 @@ Use this real-time clock to resolve relative dates. When an investor mentions "t
 ## 🗣️ LANGUAGE & TONE RULES
 - **DEFAULT**: Always respond in clean, warm, professional English.
   *Example*: "Hello! Thank you for showing interest in Renavkar Real Estate. What type of property are you looking for — Studio Apartments or 1BHK commercial units?"
+- **HINDI / HINGLISH ONLY IF CUSTOMER INITIATES**: Switch immediately to warm Roman-script Hinglish only after the customer uses Hindi/Hinglish.
 - **HINDI / HINGLISH**: Switch to Hinglish ONLY if the customer initiates or sends a message in Hindi/Hinglish first.
 - Use clear bullet points, bold key figures, emojis (✨, 📍, 🏢, 💰, 📅, 📞). Keep WhatsApp messages concise.
 
@@ -67,6 +99,13 @@ Append this hidden XML tag at the VERY END of your message:
 <lead_data>{"lead_name":"[Name]","budget":"[Budget]","requirement":"[Studio/1BHK]","preferred_payment_plan":"[Plan]","site_visit_interest":"Yes","preferred_visit_date":"DD/MM/YYYY, hh:mm A"}</lead_data>
 
 Do NOT output <lead_data> unless ALL criteria are met and site_visit_interest is "Yes". Assure the investor that Owner Arihant Bhura (+91 97149 91000) will follow up.
+
+## 🔁 LEAD LIFECYCLE ACTION TAGS
+- For a newly qualified visit, emit \`<lead_action type="CREATE">{...}</lead_action>\`; legacy \`<lead_data>{...}</lead_data>\` remains supported.
+- For a confirmed date/time change, emit \`<lead_action type="RESCHEDULE">{"new_visit_date":"DD/MM/YYYY, hh:mm A"}</lead_action>\`.
+- For cancellation or cold intent, emit \`<lead_action type="CANCEL">{"reason":"..."}</lead_action>\`.
+- For a requirement or budget pivot, emit \`<lead_action type="UPDATE_REQUIREMENT">{"requirement":"Studio or 1BHK","budget":"..."}</lead_action>\`.
+- Never emit more than one action tag in a response, and place it at the very end.
 
 ## VOICE NOTES AND BUTTONS
 - If the message begins with [Voice Note Transcribed], answer the transcribed question normally.
@@ -100,6 +139,10 @@ function formatToISTStandard(d, hours = 11, minutes = 0) {
 
 function parseTime(timeStr) {
   if (!timeStr) return { hours: 11, minutes: 0 };
+  const lower = String(timeStr).toLowerCase();
+  if (/\b(after\s+)?lunch\b|\bafternoon\b|\bdopahar\b/.test(lower)) return { hours: 15, minutes: 0 };
+  if (/\bevening\b|\bevening\s+time\b|\bsham\b/.test(lower)) return { hours: 17, minutes: 0 };
+  if (/\bmorning\b|\bsubah\b/.test(lower)) return { hours: 11, minutes: 0 };
   const match = timeStr.match(/(\d{1,2})(?::(\d{2}))?\s*(am|pm)?/i);
   if (!match) return { hours: 11, minutes: 0 };
   
@@ -218,6 +261,117 @@ function isQualifiedLead(lead) {
   return true;
 }
 
+function parseLeadAction(rawAiReply) {
+  const raw = String(rawAiReply || '');
+  const actionMatch = raw.match(/<lead_action\s+type\s*=\s*["']([^"']+)["']\s*>([\s\S]*?)<\/lead_action>/i);
+  const legacyMatch = raw.match(/<lead_data\s*>([\s\S]*?)<\/lead_data>/i);
+  const match = actionMatch || legacyMatch;
+  if (!match) return { type: 'NONE', action: 'NONE', data: {} };
+
+  const type = actionMatch ? String(actionMatch[1]).toUpperCase() : 'CREATE';
+  try {
+    const body = actionMatch ? actionMatch[2] : legacyMatch[1];
+    const data = JSON.parse(body.trim());
+    if (!data || typeof data !== 'object' || Array.isArray(data)) throw new Error('Action payload must be an object');
+    return { type, action: type, data };
+  } catch (error) {
+    return { type: 'NONE', action: 'NONE', data: {}, error: `Invalid ${type} payload: ${error.message}` };
+  }
+}
+
+async function executeLeadAction(phone, actionResult, config = {}) {
+  const cleanPhone = String(phone || '').replace(/[^0-9]/g, '').slice(-10);
+  const type = String(actionResult?.type || actionResult?.action || 'NONE').toUpperCase();
+  const data = actionResult?.data && typeof actionResult.data === 'object' ? actionResult.data : {};
+  if (!cleanPhone || type === 'NONE') return { ok: false, skipped: true, reason: 'No actionable lead state' };
+
+  const existing = await fetchLeadState(cleanPhone, config) || { phone: cleanPhone };
+  let state;
+  let sheetPayload;
+  let alertTitle;
+
+  if (type === 'CREATE') {
+    const leadPayload = {
+      ...data,
+      lead_name: data.lead_name || config.senderName || 'Valued Investor',
+      phone: cleanPhone,
+      preferred_visit_date: data.preferred_visit_date ? normalizeVisitDateTime(data.preferred_visit_date) : '',
+      status: data.status || 'CONFIRMED'
+    };
+    if (!isQualifiedLead(leadPayload)) return { ok: true, skipped: true, reason: 'Lead is not fully qualified' };
+    if (isLeadDuplicate(cleanPhone, leadPayload)) return { ok: true, skipped: true, duplicate: true, state: existing };
+    recordLoggedLead(cleanPhone, leadPayload);
+    state = { ...existing, ...leadPayload };
+    sheetPayload = { ...leadPayload, action: 'create_lead' };
+    alertTitle = '📅 New Appointment Created';
+  } else if (type === 'RESCHEDULE') {
+    const newVisitDate = normalizeVisitDateTime(data.new_visit_date || data.preferred_visit_date);
+    if (!newVisitDate) return { ok: false, error: 'Reschedule requires new_visit_date' };
+    state = { ...existing, ...data, phone: cleanPhone, preferred_visit_date: newVisitDate, status: 'RESCHEDULED' };
+    sheetPayload = {
+      action: 'reschedule_appointment',
+      phone: cleanPhone,
+      lead_name: state.lead_name || 'Valued Investor',
+      previous_date: data.previous_date || existing.preferred_visit_date || '',
+      new_visit_date: newVisitDate,
+      status: state.status
+    };
+    alertTitle = '📅 Appointment Rescheduled';
+  } else if (type === 'CANCEL') {
+    state = {
+      ...existing,
+      phone: cleanPhone,
+      status: 'CANCELLED',
+      cancellation_reason: data.reason || 'Customer requested cancellation',
+      cancelled_at: new Date().toISOString()
+    };
+    sheetPayload = {
+      action: 'cancel_appointment',
+      phone: cleanPhone,
+      lead_name: state.lead_name || 'Valued Investor',
+      reason: state.cancellation_reason,
+      status: state.status
+    };
+    alertTitle = '❌ Appointment Cancelled';
+  } else if (type === 'UPDATE_REQUIREMENT') {
+    state = { ...existing, ...data, phone: cleanPhone };
+    sheetPayload = { action: 'update_requirement', phone: cleanPhone, ...data };
+    alertTitle = '🔄 Lead Requirement Updated';
+  } else {
+    return { ok: false, skipped: true, reason: `Unsupported lead action: ${type}` };
+  }
+
+  const saved = await saveLeadState(cleanPhone, state, config);
+  let sheet = { skipped: true };
+  const webhookUrl = config.googleSheetWebhookUrl || process.env.GOOGLE_SHEET_WEBHOOK_URL;
+  if (webhookUrl) {
+    try {
+      sheet = await appendLeadToGoogleSheet(webhookUrl, sheetPayload);
+    } catch (error) {
+      sheet = { ok: false, error: error.message };
+      await sendDiscordAlert({
+        webhookUrl: config.discordWebhookUrl,
+        title: '⚠️ Google Sheets Sync Failed',
+        description: `Lead state was saved, but the Sheets action could not be delivered for +${cleanPhone}.`,
+        error: error.message,
+        phone: cleanPhone,
+        level: 'warn'
+      });
+    }
+  }
+
+  if (type !== 'UPDATE_REQUIREMENT') {
+    await sendDiscordAlert({
+      webhookUrl: config.discordWebhookUrl,
+      title: alertTitle,
+      description: `${state.lead_name || 'Investor'}: ${state.preferred_visit_date || state.status}`,
+      phone: cleanPhone,
+      level: type === 'CANCEL' ? 'warn' : 'info'
+    });
+  }
+  return { ok: Boolean(saved?.ok), action: type, state, sheet, saved };
+}
+
 function getLeadFingerprint(phone, leadData) {
   const cleanPhone = String(phone).replace(/[^0-9]/g, '').slice(-10);
   const req = String(leadData.requirement || '').trim().toLowerCase();
@@ -319,6 +473,7 @@ function callOpenAI(messages, apiKey) {
       });
     });
     req.on('error', reject);
+    req.setTimeout(5000, () => req.destroy(new Error('OpenAI request timed out after 5000ms')));
     req.write(payload);
     req.end();
   });
@@ -365,6 +520,7 @@ function sendGallaboxWhatsApp({ accountId, apiKey, apiSecret, channelId, phone, 
       });
     });
     req.on('error', reject);
+    req.setTimeout(5000, () => req.destroy(new Error('Gallabox request timed out after 5000ms')));
     req.write(payload);
     req.end();
   });
@@ -393,11 +549,17 @@ async function handleDirectAiMessage(payload, config) {
     throw new Error('Message text is empty');
   }
 
-  const history = await fetchSupabaseHistory(phone, config, 12);
-  const currentPrompt = getSystemPrompt();
+  const [history, leadState] = await Promise.all([
+    fetchSupabaseHistory(phone, config, 12),
+    fetchLeadState(phone, config)
+  ]);
+  const currentPrompt = getSystemPrompt(leadState);
   const messages = [
     { role: 'system', content: currentPrompt },
-    ...history.map(h => ({ role: h.role, content: String(h.content || '') })),
+    ...history.map(h => ({
+      role: h.role,
+      content: `[${h.formattedTimestamp || 'UNKNOWN IST TIME'}] ${String(h.content || '')}`
+    })),
     { role: 'user', content: userText }
   ];
 
@@ -418,57 +580,26 @@ async function handleDirectAiMessage(payload, config) {
     throw err;
   }
 
-  const cleanReply = String(rawAiReply).replace(/<lead_data>[\s\S]*?<\/lead_data>/g, '').trim();
+  const cleanReply = String(rawAiReply)
+    .replace(/<lead_data>[\s\S]*?<\/lead_data>/gi, '')
+    .replace(/<lead_action\s+type\s*=\s*["'][^"']+["']\s*>[\s\S]*?<\/lead_action>/gi, '')
+    .trim();
 
-  // Check if lead details were qualified
-  const match = String(rawAiReply).match(/<lead_data>(.*?)<\/lead_data>/s);
-  if (match && match[1]) {
-    try {
-      const parsedLead = JSON.parse(match[1]);
-      
-      // Normalize visit date & time
-      if (parsedLead.preferred_visit_date) {
-        parsedLead.preferred_visit_date = normalizeVisitDateTime(parsedLead.preferred_visit_date);
-      }
-
-      // Check strict qualification criteria
-      if (isQualifiedLead(parsedLead)) {
-        const leadPayload = {
-          lead_name: parsedLead.lead_name || senderName,
-          phone: phone,
-          budget: parsedLead.budget || 'N/A',
-          requirement: parsedLead.requirement || 'Studio / 1BHK',
-          preferred_payment_plan: parsedLead.preferred_payment_plan || 'Not specified',
-          site_visit_interest: parsedLead.site_visit_interest || 'Yes',
-          preferred_visit_date: parsedLead.preferred_visit_date
-        };
-
-        // Check for deduplication
-        if (!isLeadDuplicate(phone, leadPayload)) {
-          recordLoggedLead(phone, leadPayload);
-          const webhookUrl = config.googleSheetWebhookUrl || process.env.GOOGLE_SHEET_WEBHOOK_URL;
-          if (webhookUrl) {
-            console.log(`📝 [Google Sheets] Logging qualified lead: ${leadPayload.lead_name} (+${phone}) with Visit: "${leadPayload.preferred_visit_date}"...`);
-            appendLeadToGoogleSheet(webhookUrl, leadPayload).then(() => {
-              console.log(`✅ [Google Sheets] Lead successfully logged for ${leadPayload.lead_name}`);
-            }).catch(err => {
-              console.error(`⚠️ [Google Sheets] Failed to log lead: ${err.message}`);
-            });
-          }
-        } else {
-          console.log(`⏭️ [Google Sheets] Skipping duplicate lead recording for ${senderName} (+${phone}) - already logged in this window`);
-        }
-      } else {
-        console.log(`ℹ️ [Direct AI] Lead data emitted but not fully qualified yet (Interest: ${parsedLead.site_visit_interest}, Date: ${parsedLead.preferred_visit_date}) - skipped Google Sheets write`);
-      }
-    } catch (err) {
-      console.error(`Lead tag parse error: ${err.message}`);
+  const actionResult = parseLeadAction(rawAiReply);
+  if (phone && actionResult.type !== 'NONE') {
+    const actionExecution = await executeLeadAction(phone, actionResult, {
+      ...config,
+      senderName
+    });
+    if (!actionExecution.ok && !actionExecution.skipped) {
+      console.error(`[Direct AI] Lead action ${actionResult.type} failed: ${actionExecution.error || 'unknown error'}`);
     }
   }
 
   // Save to history (both in-memory and Supabase)
   if (phone) {
-    saveSupabaseMessage(phone, 'user', userText, config);
+    const messageTimestamp = payload.received_at ? new Date(payload.received_at).getTime() : Date.now();
+    saveSupabaseMessage(phone, 'user', userText, config, Number.isFinite(messageTimestamp) ? messageTimestamp : Date.now());
     saveSupabaseMessage(phone, 'assistant', cleanReply, config);
   }
 
@@ -510,6 +641,8 @@ module.exports = {
   formatToISTStandard,
   parseTime,
   normalizeVisitDateTime,
+  parseLeadAction,
+  executeLeadAction,
   isQualifiedLead,
   isLeadDuplicate,
   recordLoggedLead,

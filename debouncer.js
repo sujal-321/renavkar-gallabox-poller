@@ -95,6 +95,15 @@ class MessageDebouncer {
     return this.buffers.has(phone);
   }
 
+  clearPhone(phone, result = { ok: true, paused: true }) {
+    const entry = this.buffers.get(phone);
+    if (!entry) return false;
+    if (entry.timer) clearTimeout(entry.timer);
+    this.buffers.delete(phone);
+    entry.resolves.forEach(resolve => resolve(result));
+    return true;
+  }
+
   clear() {
     for (const [, entry] of this.buffers.entries()) {
       if (entry.timer) clearTimeout(entry.timer);
@@ -104,4 +113,3 @@ class MessageDebouncer {
 }
 
 module.exports = { MessageDebouncer, calculateAdaptiveDelay };
-

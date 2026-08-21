@@ -36,6 +36,31 @@ test('appendLeadToGoogleSheet sends POST request to webhook', async () => {
   await new Promise(resolve => server.close(resolve));
 });
 
+test('appendLeadToGoogleSheet forwards lifecycle action payloads', async () => {
+  let receivedBody = null;
+  const server = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', c => body += c);
+    req.on('end', () => {
+      receivedBody = JSON.parse(body);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    });
+  });
+
+  await new Promise(resolve => server.listen(0, resolve));
+  const webhookUrl = `http://127.0.0.1:${server.address().port}/exec`;
+  await appendLeadToGoogleSheet(webhookUrl, {
+    action: 'reschedule_appointment',
+    phone: '9014998200',
+    new_visit_date: '23/08/2026, 11:00 AM'
+  });
+
+  assert.equal(receivedBody.action, 'reschedule_appointment');
+  assert.equal(receivedBody.new_visit_date, '23/08/2026, 11:00 AM');
+  await new Promise(resolve => server.close(resolve));
+});
+
 test('appendLeadToGoogleSheet gracefully skips if no webhook url provided', async () => {
   const result = await appendLeadToGoogleSheet('', { lead_name: 'Nobody' });
   assert.equal(result.skipped, true);

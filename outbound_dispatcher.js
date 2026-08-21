@@ -1,11 +1,13 @@
 'use strict';
 
+const http = require('http');
 const https = require('https');
 
 function fetchJsonWithRedirect(url) {
   return new Promise((resolve, reject) => {
     const u = new URL(url);
-    https.get(u, res => {
+    const client = u.protocol === 'http:' ? http : https;
+    const req = client.get(u, res => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
         return fetchJsonWithRedirect(res.headers.location).then(resolve).catch(reject);
       }
@@ -18,7 +20,9 @@ function fetchJsonWithRedirect(url) {
           resolve({ raw: b });
         }
       });
-    }).on('error', reject);
+    });
+    req.setTimeout(3000, () => req.destroy(new Error('Outbound request timed out after 3000ms')));
+    req.on('error', reject);
   });
 }
 
@@ -66,6 +70,7 @@ function sendOutboundTemplate({ accountId, apiKey, apiSecret, channelId, phone, 
       });
     });
 
+    req.setTimeout(5000, () => req.destroy(new Error('Gallabox outbound request timed out after 5000ms')));
     req.on('error', reject);
     req.write(payload);
     req.end();

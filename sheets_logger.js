@@ -1,5 +1,6 @@
 'use strict';
 
+const http = require('http');
 const https = require('https');
 
 function appendLeadToGoogleSheet(webhookUrl, leadData) {
@@ -10,9 +11,11 @@ function appendLeadToGoogleSheet(webhookUrl, leadData) {
 
     const payload = JSON.stringify(leadData);
     const u = new URL(webhookUrl);
+    const client = u.protocol === 'http:' ? http : https;
 
-    const req = https.request({
+    const req = client.request({
       hostname: u.hostname,
+      port: u.port || undefined,
       path: u.pathname + u.search,
       method: 'POST',
       headers: {
@@ -22,7 +25,9 @@ function appendLeadToGoogleSheet(webhookUrl, leadData) {
     }, res => {
       // Google Apps Script redirects with 302 to googleusercontent.com
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-        https.get(res.headers.location, redRes => {
+        const redirectUrl = new URL(res.headers.location, u);
+        const redirectClient = redirectUrl.protocol === 'http:' ? http : https;
+        redirectClient.get(redirectUrl, redRes => {
           let body = '';
           redRes.on('data', c => body += c);
           redRes.on('end', () => {
@@ -51,6 +56,7 @@ function appendLeadToGoogleSheet(webhookUrl, leadData) {
       });
     });
 
+    req.setTimeout(3000, () => req.destroy(new Error('Google Sheets request timed out after 3000ms')));
     req.on('error', reject);
     req.write(payload);
     req.end();

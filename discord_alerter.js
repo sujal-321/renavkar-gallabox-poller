@@ -48,6 +48,7 @@ function sendDiscordAlert({ webhookUrl, title, description, error, phone, level 
         resolve({ ok: false, error: err.message });
       });
 
+      req.setTimeout(3000, () => req.destroy(new Error('Discord request timed out after 3000ms')));
       req.write(payload);
       req.end();
     } catch (err) {

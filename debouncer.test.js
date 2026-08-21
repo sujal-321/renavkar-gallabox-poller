@@ -107,3 +107,20 @@ test('debouncer dispatches button click immediately in adaptive mode', async () 
   assert.equal(dispatched.length, 1);
   assert.ok(elapsed < 100, `Button dispatch should be immediate (<100ms), took ${elapsed}ms`);
 });
+
+test('debouncer can cancel one phone when a human agent takes over', async () => {
+  let dispatched = 0;
+  const debouncer = new MessageDebouncer({
+    debounceMs: 50,
+    onFlush: async () => { dispatched += 1; return { ok: true }; }
+  });
+
+  const pending = debouncer.push('919014998200', { message_id: 'human-1', message_text: 'Sunday' });
+  const cleared = debouncer.clearPhone('919014998200');
+  const result = await pending;
+
+  assert.equal(cleared, true);
+  assert.equal(result.paused, true);
+  assert.equal(dispatched, 0);
+  assert.equal(debouncer.isPending('919014998200'), false);
+});
