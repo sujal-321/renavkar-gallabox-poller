@@ -108,9 +108,8 @@ function validateConfig() {
   for (const name of ['GALLABOX_ACCOUNT_ID', 'GALLABOX_API_KEY', 'GALLABOX_API_SECRET', 'GALLABOX_CHANNEL_ID', 'OPENAI_API_KEY']) {
     if (!process.env[name]) throw new Error(`Missing required environment variable: ${name}`);
   }
-  if (!process.env.SUPABASE_URL) throw new Error('Missing required environment variable: SUPABASE_URL');
-  if (!process.env.SUPABASE_KEY && !process.env.SUPABASE_SERVICE_ROLE_KEY) {
-    throw new Error('Missing required environment variable: SUPABASE_KEY');
+  if (!process.env.SUPABASE_URL || (!process.env.SUPABASE_KEY && !process.env.SUPABASE_SERVICE_ROLE_KEY)) {
+    console.warn('⚠️ [Config] SUPABASE_URL or SUPABASE_KEY not provided; lead state & memory will operate via local high-speed in-memory store.');
   }
 }
 
