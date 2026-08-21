@@ -21,8 +21,8 @@ const LEAD_STATE_HISTORY_PREFIX = '[RENAVKAR_LEAD_STATE] ';
 
 function supabaseConfig(config) {
   return {
-    url: config?.supabaseUrl || process.env.SUPABASE_URL,
-    key: config?.supabaseKey || process.env.SUPABASE_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY
+    url: config?.supabaseUrl || process.env.SUPABASE_URL || '',
+    key: config?.supabaseKey || process.env.SUPABASE_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY || ''
   };
 }
 

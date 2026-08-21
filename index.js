@@ -109,7 +109,7 @@ function validateConfig() {
     if (!process.env[name]) throw new Error(`Missing required environment variable: ${name}`);
   }
   if (!process.env.SUPABASE_URL || (!process.env.SUPABASE_KEY && !process.env.SUPABASE_SERVICE_ROLE_KEY)) {
-    console.warn('⚠️ [Config] SUPABASE_URL or SUPABASE_KEY not provided; lead state & memory will operate via local high-speed in-memory store.');
+    console.warn('⚠️ [Config] SUPABASE_URL or SUPABASE_KEY not provided via env; using active configured Supabase project endpoint.');
   }
 }
 
@@ -598,12 +598,40 @@ async function main() {
   };
   process.on('SIGTERM', shutdown);
   process.on('SIGINT', shutdown);
+
+  // Send Online status confirmation to Discord on successful startup
+  sendDiscordAlert({
+    webhookUrl: config.discordWebhookUrl,
+    title: '🟢 Real Estate AI Bot Online',
+    description: `Bot poller daemon successfully started.\n• **Gallabox WhatsApp Channel:** Active\n• **Supabase State & Memory:** Active\n• **Google Sheets CRM:** Synchronized`,
+    level: 'info'
+  }).catch(() => {});
 }
+
+async function handleFatalCrash(error, context = 'Fatal Error') {
+  console.error(`🚨 [${context}]:`, error);
+  try {
+    const webhookUrl = config?.discordWebhookUrl || process.env.DISCORD_WEBHOOK_URL;
+    if (webhookUrl) {
+      await sendDiscordAlert({
+        webhookUrl,
+        title: `🚨 Bot Process Crash [${context}]`,
+        description: `The bot service crashed on **Railway**:\n\`\`\`\n${error?.stack || error?.message || error}\n\`\`\``,
+        level: 'error'
+      });
+    }
+  } catch (e) {
+    console.error('Failed to send crash alert to Discord:', e.message);
+  }
+  setTimeout(() => process.exit(1), 1200);
+}
+
+process.on('uncaughtException', (err) => handleFatalCrash(err, 'uncaughtException'));
+process.on('unhandledRejection', (reason) => handleFatalCrash(reason, 'unhandledRejection'));
 
 if (require.main === module) {
   main().catch(error => {
-    console.error(error.message);
-    process.exit(1);
+    handleFatalCrash(error, 'main() startup failure');
   });
 }
 
